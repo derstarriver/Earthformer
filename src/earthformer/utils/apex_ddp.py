@@ -1,16 +1,23 @@
 # Find the original code and discussion at https://github.com/PyTorchLightning/pytorch-lightning/discussions/10922
 # We will need to use the AMP implementation from apex because https://discuss.pytorch.org/t/using-torch-utils-checkpoint-checkpoint-with-dataparallel/78452
 
-from apex.parallel import DistributedDataParallel
 from pytorch_lightning.strategies.ddp import DDPStrategy
 from pytorch_lightning.overrides.base import (
     _LightningModuleWrapperBase,
     _LightningPrecisionModuleWrapperBase,
 )
 
+try:
+    from apex.parallel import DistributedDataParallel as ApexDDP
+    _HAS_APEX = True
+except ImportError:
+    ApexDDP = None
+    _HAS_APEX = False
+
+
 def unwrap_lightning_module(wrapped_model):
     model = wrapped_model
-    if isinstance(model, DistributedDataParallel):
+    if ApexDDP is not None and isinstance(model, ApexDDP):
         model = unwrap_lightning_module(model.module)
     if isinstance(
         model, (_LightningModuleWrapperBase, _LightningPrecisionModuleWrapperBase)
@@ -20,8 +27,14 @@ def unwrap_lightning_module(wrapped_model):
 
 
 class ApexDDPStrategy(DDPStrategy):
+    def __init__(self, *args, **kwargs):
+        if not _HAS_APEX:
+            raise ImportError(
+                "ApexDDPStrategy requires NVIDIA Apex. Install it or use strategy='auto' for single GPU.")
+        super().__init__(*args, **kwargs)
+
     def _setup_model(self, model):
-        return DistributedDataParallel(model, delay_allreduce=False)
+        return ApexDDP(model, delay_allreduce=False)
 
     @property
     def lightning_module(self):

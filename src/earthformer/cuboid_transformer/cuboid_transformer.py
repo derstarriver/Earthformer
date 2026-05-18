@@ -1,4 +1,8 @@
 """A space-time Transformer with Cuboid Attention"""
+# python scripts/cuboid_transformer/enso/train_cuboid_enso.py \
+#     --gpus 1 --save enso_test \
+#     --data_dir ./datasets/enso_multivar/
+
 from typing import Sequence, Union
 import warnings
 from functools import lru_cache
@@ -7,7 +11,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 import torch.utils.checkpoint as checkpoint
-from einops import rearrange
+# from einops import rearrange
 from .cuboid_transformer_patterns import CuboidSelfAttentionPatterns, CuboidCrossAttentionPatterns
 from .utils import (
     get_activation, get_norm_layer,
