@@ -59,7 +59,7 @@ def read_cmip_multivar(data_dir, cmip6_cutoff=2265, cmip6_ypm=151, cmip5_ypm=140
             f"Run: python scripts/datasets/preprocess_enso.py --data_dir {data_dir}")
 
     print("Loading CMIP cache...")
-    data = np.load(cache_file, mmap_mode='r')
+    data = np.load(cache_file)
     cmip6_data = data['cmip6_data']
     cmip5_data = data['cmip5_data']
     cmip6_nino = data['cmip6_nino']
@@ -87,7 +87,7 @@ def read_soda_multivar(data_dir, var_stats=None):
             f"Run: python scripts/datasets/preprocess_enso.py --data_dir {data_dir}")
 
     print("Loading SODA cache...")
-    data = np.load(cache_file, mmap_mode='r')
+    data = np.load(cache_file)
     soda_data = data['soda_data']
     soda_nino = data['soda_nino']
     with open(meta_file, 'rb') as f:
@@ -121,8 +121,8 @@ class MultivarCMIPDataset(Dataset):
 
     def __getitem__(self, idx):
         seq_idx = self.idx_seq[idx]
-        x = np.array(self.data[seq_idx])
-        y = np.array(self.nino[seq_idx[self.nino_idx]])
+        x = self.data[seq_idx].copy()
+        y = self.nino[seq_idx[self.nino_idx]].copy()
         return torch.from_numpy(x), torch.from_numpy(y)
 
 
@@ -145,8 +145,8 @@ class MultivarSODADataset(Dataset):
 
     def __getitem__(self, idx):
         seq_idx = self.idx_seq[idx]
-        x = np.array(self.data[seq_idx])
-        y = np.array(self.nino[seq_idx[self.nino_idx]])
+        x = self.data[seq_idx].copy()
+        y = self.nino[seq_idx[self.nino_idx]].copy()
         return torch.from_numpy(x), torch.from_numpy(y)
 
 

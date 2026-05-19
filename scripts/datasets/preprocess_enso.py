@@ -13,6 +13,8 @@ Output files in data_dir:
     .cache_soda.npz       — processed SODA data & labels
     .cache_soda_meta.pkl  — coordinate arrays
 """
+
+#将数据预处理成npz格式的
 import os
 import sys
 import pickle

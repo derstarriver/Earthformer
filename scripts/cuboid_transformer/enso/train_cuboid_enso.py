@@ -5,6 +5,31 @@ Data: CMIP_train.nc + CMIP_label.nc (train), SODA_train.nc + SODA_label.nc (val/
 Variables: sst, t300, ua, va
 Grid: auto-detected from data
 """
+
+
+""" 
+
+TEST
+python scripts/cuboid_transformer/enso/train_cuboid_enso.py \
+     --gpus 1 --test --save enso_test \
+    --data_dir ./datasets/enso_multivar/ \
+    --ckpt_name last.ckpt
+    
+TRAIN   
+python scripts/cuboid_transformer/enso/train_cuboid_enso.py \
+    --gpus 1 --save enso_test \
+    --data_dir ./datasets/enso_multivar/ \
+    --cfg scripts/cuboid_transformer/enso/cfg.yaml   
+    
+  
+Continue
+python scripts/cuboid_transformer/enso/train_cuboid_enso.py \
+    --gpus 1 --save enso_test \
+    --data_dir ./datasets/enso_multivar/ \
+    --cfg scripts/cuboid_transformer/enso/cfg.yaml \
+    --ckpt_name last.ckpt
+  
+"""
 import warnings
 from typing import Sequence
 from shutil import copyfile
@@ -14,6 +39,10 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 from torch.optim.lr_scheduler import LambdaLR, CosineAnnealingLR
+
+# PyTorch 2.6+ weights_only fix — PL 1.6.4 ckpt has nested OmegaConf types
+_orig_torch_load = torch.load
+torch.load = lambda *a, **kw: _orig_torch_load(*a, **{**kw, "weights_only": False})
 import torchmetrics
 import pytorch_lightning as pl
 from pytorch_lightning import Trainer, seed_everything, loggers as pl_loggers
@@ -37,6 +66,15 @@ try:
     _HAS_APEX = True
 except ImportError:
     _HAS_APEX = False
+
+
+class EpochProgressBar(TQDMProgressBar):
+    """TQDM bar showing Epoch X/Y."""
+    def on_train_epoch_start(self, trainer, pl_module):
+        super().on_train_epoch_start(trainer, pl_module)
+        if self.main_progress_bar is not None:
+            self.main_progress_bar.set_description(
+                f"Epoch {trainer.current_epoch + 1}/{trainer.max_epochs}", refresh=True)
 
 
 _curr_dir = os.path.realpath(os.path.dirname(os.path.realpath(__file__)))
@@ -395,7 +433,7 @@ class CuboidENSOPLModule(pl.LightningModule):
             save_top_k=self.oc.optim.save_top_k,
             save_last=True, mode="min")
         callbacks = kwargs.pop("callbacks", [])
-        callbacks += [checkpoint_callback, TQDMProgressBar(refresh_rate=1)]
+        callbacks += [checkpoint_callback, EpochProgressBar()]
         if self.oc.logging.monitor_lr:
             callbacks += [LearningRateMonitor(logging_interval='step')]
         if self.oc.logging.monitor_device:
@@ -472,8 +510,8 @@ class CuboidENSOPLModule(pl.LightningModule):
         pred_seq, loss, in_seq, target_seq, nino_target = self(batch)
         if self.precision == 16:
             pred_seq = pred_seq.float()
-        sst_pred = pred_seq[..., 0:1]
-        sst_target = target_seq[..., 0:1]
+        sst_pred = pred_seq[..., 0:1].contiguous()
+        sst_target = target_seq[..., 0:1].contiguous()
         self.valid_mse(sst_pred, sst_target)
         self.valid_mae(sst_pred, sst_target)
         nino_preds = sst_to_nino(sst=pred_seq[..., 0],
@@ -505,8 +543,8 @@ class CuboidENSOPLModule(pl.LightningModule):
         pred_seq, loss, in_seq, target_seq, nino_target = self(batch)
         if self.precision == 16:
             pred_seq = pred_seq.float()
-        sst_pred = pred_seq[..., 0:1]
-        sst_target = target_seq[..., 0:1]
+        sst_pred = pred_seq[..., 0:1].contiguous()
+        sst_target = target_seq[..., 0:1].contiguous()
         self.test_mse(sst_pred, sst_target)
         self.test_mae(sst_pred, sst_target)
         nino_preds = sst_to_nino(sst=pred_seq[..., 0],
