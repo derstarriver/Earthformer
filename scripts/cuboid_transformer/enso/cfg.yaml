@@ -1,7 +1,7 @@
 # Earthformer ENSO/SST multi-variable prediction config
 # Grid dimensions (lat, lon) are auto-detected from data at runtime.
 # Variables: sst, t300, ua, va
-
+#test
 dataset:
   in_len: 12
   out_len: 26
@@ -28,7 +28,7 @@ optim:
   lr: 0.0001
   wd: 1.0e-05
   gradient_clip_val: 1.0
-  max_epochs: 30
+  max_epochs: 40
   lr_scheduler_mode: "cosine"
   min_lr_ratio: 1.0e-3
   warmup_min_lr_ratio: 0.0

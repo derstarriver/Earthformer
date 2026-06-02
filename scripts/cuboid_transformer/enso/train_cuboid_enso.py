@@ -558,11 +558,24 @@ class CuboidENSOPLModule(pl.LightningModule):
         nino_preds_list, nino_target_list = map(list, zip(*outputs))
         nino_preds_list = torch.cat(nino_preds_list, dim=0)
         nino_target_list = torch.cat(nino_target_list, dim=0)
+
+        # Per-lead-month correlation
+        pred = nino_preds_list - nino_preds_list.mean(dim=0, keepdim=True)
+        true = nino_target_list - nino_target_list.mean(dim=0, keepdim=True)
+        cor_per_lead = (pred * true).sum(dim=0) / (
+            torch.sqrt(torch.sum(pred**2, dim=0) * torch.sum(true**2, dim=0)) + 1e-6)
+
         test_acc, test_nino_rmse = compute_enso_score(nino_preds_list, nino_target_list, acc_weight=None)
         test_weighted_acc, _ = compute_enso_score(nino_preds_list, nino_target_list, acc_weight="default")
         test_acc /= self.nino_out_len
         test_nino_rmse /= self.nino_out_len
         test_weighted_acc /= self.nino_out_len
+
+        # Print per-lead-month correlations
+        print("\nNino3.4 correlation per lead month:")
+        for i in range(self.nino_out_len):
+            print(f"  lead {i+1:2d} month:  {cor_per_lead[i].item():+.4f}")
+        print()
 
         self.log('test_sst_mse_epoch', test_sst_mse, prog_bar=True)
         self.log('test_sst_mae_epoch', test_sst_mae, prog_bar=True)
