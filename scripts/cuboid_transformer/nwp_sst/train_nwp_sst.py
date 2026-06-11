@@ -11,13 +11,14 @@ Usage:
     --cfg scripts/cuboid_transformer/nwp_sst/cfg_nwp.yaml
 
 
-    CONTINUE
-    python scripts/cuboid_transformer/nwp_sst/train_nwp_sst.py \
+ # 断点续训
+python scripts/cuboid_transformer/nwp_sst/train_nwp_sst.py \
     --gpus 1 --save nwp_exp1 --data_dir datasets/SST-PREDICT/ \
+    --cfg scripts/cuboid_transformer/nwp_sst/cfg_nwp.yaml \
     --ckpt_name last.ckpt
 
-    TEST
-    python scripts/cuboid_transformer/nwp_sst/train_nwp_sst.py \
+# 测试
+python scripts/cuboid_transformer/nwp_sst/train_nwp_sst.py \
     --gpus 1 --test --save nwp_exp1 --data_dir datasets/SST-PREDICT/ \
     --ckpt_name last.ckpt
 
@@ -35,8 +36,8 @@ from torch.nn import functional as F
 from torch.optim.lr_scheduler import LambdaLR, CosineAnnealingLR
 import torchmetrics
 import pytorch_lightning as pl
-from pytorch_lightning import Trainer, seed_everything, loggers as pl_loggers
-from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor, DeviceStatsMonitor, Callback
+from pytorch_lightning import Trainer, seed_everything
+from pytorch_lightning.callbacks import ModelCheckpoint, DeviceStatsMonitor, Callback
 from pytorch_lightning.callbacks.progress import TQDMProgressBar
 from pytorch_lightning.callbacks.early_stopping import EarlyStopping
 from omegaconf import OmegaConf
@@ -325,6 +326,42 @@ class NWPPredictionModule(pl.LightningModule):
     def lr_scheduler_step(self, scheduler, optimizer_idx, metric):
         scheduler.step()
 
+    def _save_hparams(self):
+        """Save hparams.json once."""
+        import json
+        hparams_path = os.path.join(self.save_dir, "hparams.json")
+        oc_dict = OmegaConf.to_container(self.oc, resolve=True)
+        with open(hparams_path, 'w') as f:
+            json.dump(oc_dict, f, indent=2)
+        print(f"  Hparams saved: {hparams_path}")
+
+    def on_fit_start(self):
+        """Save hyperparameters and CSV header once at training start."""
+        self._save_hparams()
+
+        self._csv_path = os.path.join(self.save_dir, "metrics.csv")
+        header = "epoch,train_loss,valid_loss,valid_mse,valid_mae,learning_rate\n"
+        # Write header only if file is new
+        if not os.path.exists(self._csv_path):
+            with open(self._csv_path, 'w') as f:
+                f.write(header)
+        print(f"  Metrics CSV: {self._csv_path}")
+
+    def on_train_epoch_end(self):
+        """Append one row to metrics CSV after each training epoch."""
+        if not hasattr(self, '_csv_path'):
+            return
+        train_loss = self.trainer.callback_metrics.get('train_loss_epoch', 0)
+        valid_loss = self.trainer.callback_metrics.get('valid_loss', 0)
+        valid_mse = self.trainer.callback_metrics.get('valid_mse_epoch', 0)
+        valid_mae = self.trainer.callback_metrics.get('valid_mae_epoch', 0)
+        lr = self.trainer.optimizers[0].param_groups[0]['lr']
+        epoch = self.current_epoch
+
+        row = f"{epoch},{float(train_loss):.6f},{float(valid_loss):.6f},{float(valid_mse):.6f},{float(valid_mae):.6f},{lr:.8f}\n"
+        with open(self._csv_path, 'a') as f:
+            f.write(row)
+
     # ── Trainer setup ──
     def set_trainer_kwargs(self, **kwargs):
         ckpt_cb = ModelCheckpoint(
@@ -333,8 +370,6 @@ class NWPPredictionModule(pl.LightningModule):
             save_last=True, mode="min")
         callbacks = kwargs.pop("callbacks", [])
         callbacks += [ckpt_cb, EpochProgressBar()]
-        if self.oc.logging.monitor_lr:
-            callbacks.append(LearningRateMonitor(logging_interval='step'))
         if self.oc.logging.monitor_device:
             callbacks.append(DeviceStatsMonitor())
         if self.oc.optim.early_stop:
@@ -342,9 +377,7 @@ class NWPPredictionModule(pl.LightningModule):
                 monitor="valid_mse_epoch", patience=self.oc.optim.early_stop_patience,
                 mode=self.oc.optim.early_stop_mode))
 
-        logger = kwargs.pop("logger", [])
-        logger += [pl_loggers.TensorBoardLogger(save_dir=self.save_dir),
-                   pl_loggers.CSVLogger(save_dir=self.save_dir)]
+        logger = False   # use custom CSV logging in on_train_epoch_end
 
         log_steps = max(1, int(self.oc.trainer.log_step_ratio * self.total_num_steps))
         skip = inspect.signature(Trainer).parameters.keys()
@@ -401,6 +434,9 @@ class NWPPredictionModule(pl.LightningModule):
         self.valid_mse.reset()
         self.valid_mae.reset()
 
+    def on_test_start(self):
+        self._save_hparams()
+
     def test_step(self, batch, batch_idx, dataloader_idx=0):
         X, Y, mask = batch
         pred = self(X, mask)
@@ -445,9 +481,17 @@ class NWPPredictionModule(pl.LightningModule):
         self.log('test_mse_epoch', mse_per_day.mean(), prog_bar=True)
         self.log('test_mae_epoch', mae_per_day.mean(), prog_bar=True)
 
-    def on_test_end(self):
-        # Cleanup
-        pass
+        # Save test results CSV
+        test_csv = os.path.join(self.save_dir, "test_metrics.csv")
+        with open(test_csv, 'w') as f:
+            f.write("lead_day,mse_norm,mae_norm,rmse_celsius,mae_celsius\n")
+            for d in range(len(mse_per_day)):
+                line = (f"{d+1},{float(mse_per_day[d]):.6f},{float(mae_per_day[d]):.6f},"
+                        f"{float(rmse_degC[d]):.4f},{float(mae_degC[d]):.4f}\n")
+                f.write(line)
+            f.write(f"avg,{float(mse_per_day.mean()):.6f},{float(mae_per_day.mean()):.6f},"
+                    f"{float(rmse_degC.mean()):.4f},{float(mae_degC.mean()):.4f}\n")
+        print(f"  Test results saved: {test_csv}")
 
 
 # ── Main ──
