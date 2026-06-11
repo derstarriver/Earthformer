@@ -13,8 +13,8 @@ from datetime import datetime, timedelta
 from collections import defaultdict
 
 # ─── Paths ───
-WIND_PATH = r"/home/lab/zhangxm/gxy/Earthformer/datasets/SST-PREDICT/Wind_cropped.nc"
-SST_PATH = r"/home/lab/zhangxm/gxy/Earthformer/datasets/SST-PREDICT/SST_cropped.nc"
+WIND_PATH = r"/home/lab/zhangxm/gxy/Earthformer/datasets/SST-PREDICT/wind23-25.nc"
+SST_PATH = r"/home/lab/zhangxm/gxy/Earthformer/datasets/SST-PREDICT/SST23-25.nc"
 
 
 # WIND_PATH = r"F:\Data\ERA5 SST\SST.nc"

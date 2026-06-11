@@ -32,9 +32,9 @@ PRED_LEN = 3             # 3-day forecast
 TOTAL_LEN = INPUT_LEN + PRED_LEN  # 17
 
 # ─── Train/val/test split by year ───
-TRAIN_YEARS = (2001, 2020)
-VAL_YEARS = (2021, 2021)
-TEST_YEARS = (2022, 2022)
+TRAIN_YEARS = (2001, 2023)
+VAL_YEARS = (2024, 2024)
+TEST_YEARS = (2025, 2025)
 
 
 class NWPacificDataset(Dataset):
