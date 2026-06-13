@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """Train Earthformer for NW Pacific daily SSTA prediction.
 1213132123132132
-Input:  14 days × 161×241 × 3 channels [ssta, u10, v10]
+Input:  14 days × 161×241 × 4 channels [ssta, u10, v10, sla]
 Output:  3 days × 161×241 × 1 channel  [ssta]
 
 Usage:
@@ -243,8 +243,8 @@ class NWPPredictionModule(pl.LightningModule):
     @staticmethod
     def _default_model():
         cfg = OmegaConf.create()
-        cfg.data_channels = 3
-        cfg.input_shape = (14, 161, 241, 3)
+        cfg.data_channels = 4
+        cfg.input_shape = (14, 161, 241, 4)
         cfg.target_shape = (3, 161, 241, 1)
         cfg.base_units = 64
         cfg.scale_alpha = 1.0
@@ -341,8 +341,11 @@ class NWPPredictionModule(pl.LightningModule):
 
         self._csv_path = os.path.join(self.save_dir, "metrics.csv")
         header = "epoch,train_loss,valid_loss,valid_mse,valid_mae,learning_rate\n"
-        # Write header only if file is new
-        if not os.path.exists(self._csv_path):
+        # Truncate on fresh run (epoch 0); append on resume
+        if self.trainer.current_epoch == 0:
+            with open(self._csv_path, 'w') as f:
+                f.write(header)
+        elif not os.path.exists(self._csv_path):
             with open(self._csv_path, 'w') as f:
                 f.write(header)
         print(f"  Metrics CSV: {self._csv_path}")

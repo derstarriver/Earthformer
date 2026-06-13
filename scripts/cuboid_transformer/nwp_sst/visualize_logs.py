@@ -145,9 +145,23 @@ def plot_prediction(ckpt_path, data_dir, save_path):
     sd = {k.replace('torch_nn_module.', ''): v for k, v in sd.items()
           if k.startswith('torch_nn_module.')} or sd
 
+    # Detect old 3‑channel checkpoints and pad initial Conv weights
+    old_ckpt = False
+    for k, v in sd.items():
+        if 'initial_encoder' in k and 'conv_block' in k and 'conv' in k \
+           and v.ndim == 4 and v.shape[1] == 3:
+            old_ckpt = True
+            print(f"  Detected 3‑channel checkpoint — padding Conv to 4 channels")
+    if old_ckpt:
+        for k, v in list(sd.items()):
+            if 'initial_encoder' in k and 'conv_block' in k and 'conv' in k \
+               and v.ndim == 4 and v.shape[1] == 3:
+                pad = torch.zeros(v.shape[0], 1, v.shape[2], v.shape[3])
+                sd[k] = torch.cat([v, pad], dim=1)
+
     from earthformer.cuboid_transformer.cuboid_transformer import CuboidTransformerModel
     model = CuboidTransformerModel(
-        input_shape=(14, 161, 241, 3), target_shape=(3, 161, 241, 1),
+        input_shape=(14, 161, 241, 4), target_shape=(3, 161, 241, 1),
         base_units=64, scale_alpha=1.0,
         enc_depth=[2, 2, 2], dec_depth=[2, 2, 2],
         enc_use_inter_ffn=True, dec_use_inter_ffn=True, dec_hierarchical_pos_embed=True,
@@ -167,7 +181,7 @@ def plot_prediction(ckpt_path, data_dir, save_path):
         initial_downsample_scale=[1, 4, 4],
         initial_downsample_conv_layers=3, final_upsample_conv_layers=2, checkpoint_level=0,
     )
-    model.load_state_dict(sd, strict=False)
+    model.load_state_dict(sd, strict=True)
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     model = model.to(device).eval()
 
@@ -192,7 +206,17 @@ def plot_prediction(ckpt_path, data_dir, save_path):
         arr[:, ~m] = np.nan
     X_c[~m] = np.nan
 
-    vmax = max(np.nanmax(np.abs(Y_c)), np.nanmax(np.abs(P_c)), np.nanmax(np.abs(X_c)), 1.0)
+    # Clamp colorbar to 1st–99th percentile of valid data (outlier-proof)
+    all_valid = np.concatenate([
+        X_c[~np.isnan(X_c)].ravel(),
+        Y_c[~np.isnan(Y_c)].ravel(),
+        P_c[~np.isnan(P_c)].ravel(),
+    ])
+    if len(all_valid) > 0:
+        lo, hi = np.nanpercentile(all_valid, [1, 99])
+        vmax = max(abs(lo), abs(hi), 0.5)
+    else:
+        vmax = 1.0
     vmin = -vmax
 
     fig, axes = plt.subplots(3, 3, figsize=(18, 15))
@@ -242,6 +266,15 @@ def main():
     csv_path = os.path.join(args.exp_dir, 'metrics.csv')
     if os.path.exists(csv_path):
         df = pd.read_csv(csv_path)
+
+        # Detect epoch resets (multiple runs appended) — keep only last run
+        resets = df.index[df['epoch'] < df['epoch'].shift()].tolist()
+        if resets:
+            last_start = resets[-1]
+            print(f"metrics.csv: {len(df)} rows — detected {len(resets)} restart(s), "
+                  f"using last {len(df) - last_start} rows")
+            df = df.iloc[last_start:].reset_index(drop=True)
+
         print(f"metrics.csv: {len(df)} epochs ({int(df['epoch'].min())}→{int(df['epoch'].max())})")
         if 'valid_mse' in df.columns and len(df) > 0:
             best = df['valid_mse'].idxmin()

@@ -2,12 +2,13 @@
 """
 NW Pacific SST Prediction Dataset for Earthformer.
 
-Builds a lazy-loading PyTorch Dataset from preprocessed ERA5 data:
+Builds a lazy-loading PyTorch Dataset from preprocessed ERA5 + SLA data:
   - SSTA (ssta.nc): daily sea surface temperature anomaly
   - Wind (Wind_cropped.nc): daily 10m u10, v10
+  - SLA  (SLA_cropped.nc): daily sea level anomaly
   - Ocean mask (mask.npy): 1=ocean, 0=land
 
-    Input:  14 days × 161×241 × 3 channels [ssta, u10, v10]
+    Input:  14 days × 161×241 × 4 channels [ssta, u10, v10, sla]
     Output:  3 days × 161×241 × 1 channel  [ssta]
 
 Usage:
@@ -32,8 +33,8 @@ PRED_LEN = 3             # 3-day forecast
 TOTAL_LEN = INPUT_LEN + PRED_LEN  # 17
 
 # ─── Train/val/test split by year ───
-TRAIN_YEARS = (2001, 2023)
-VAL_YEARS = (2024, 2024)
+TRAIN_YEARS = (2001, 2022)
+VAL_YEARS = (2023, 2024)
 TEST_YEARS = (2025, 2025)
 
 
@@ -77,9 +78,9 @@ class NWPacificDataset(Dataset):
 
     def __getitem__(self, idx):
         # Slice from backing array (creates a view → copy to tensor)
-        seq = self.data[idx:idx + self.total_len]            # (17, 161, 241, 3)
-        x = np.ascontiguousarray(seq[:self.input_len])       # (14, 161, 241, 3)
-        y = np.ascontiguousarray(seq[self.input_len:, ..., 0:1])  # (3, 161, 241, 1)
+        seq = self.data[idx:idx + self.total_len]            # (17, 161, 241, C)
+        x = np.ascontiguousarray(seq[:self.input_len])       # (14, 161, 241, C)
+        y = np.ascontiguousarray(seq[self.input_len:, ..., 0:1])  # (3, 161, 241, 1) — ssta only
 
         return (
             torch.from_numpy(x),
@@ -124,7 +125,6 @@ def compute_normalization_stats(data_dir, train_mask=None):
 
     stats = {}
     stats['ssta'] = ocean_mean_std(ssta, train_mask)
-    # For wind, compute over all valid (non-NaN) ocean
     u10_m = float(np.mean(u10[train_mask][:, ocean_mask]))
     u10_s = float(np.std(u10[train_mask][:, ocean_mask]))
     v10_m = float(np.mean(v10[train_mask][:, ocean_mask]))
@@ -132,16 +132,29 @@ def compute_normalization_stats(data_dir, train_mask=None):
     stats['u10'] = (u10_m, u10_s)
     stats['v10'] = (v10_m, v10_s)
 
+    # SLA: ocean-only stats (NaN-safe, exclude land + missing data)
+    sla_path = os.path.join(data_dir, "SLA_cropped.nc")
+    ds_sla = xr.open_dataset(sla_path)
+    sla = ds_sla['sla'].values
+    sla_train = sla[train_mask]                          # (T_train, 161, 241)
+    sla_ocean = sla_train[:, ocean_mask]                 # ocean pixels only
+    sla_mean = float(np.nanmean(sla_ocean))
+    sla_std  = float(np.nanstd(sla_ocean))
+    stats['sla'] = (sla_mean, sla_std)
+    ds_sla.close()
+
     print(f"  ssta: mean={stats['ssta'][0]:.4f}, std={stats['ssta'][1]:.4f}")
     print(f"  u10:  mean={stats['u10'][0]:.4f}, std={stats['u10'][1]:.4f}")
     print(f"  v10:  mean={stats['v10'][0]:.4f}, std={stats['v10'][1]:.4f}")
+    print(f"  sla:  mean={stats['sla'][0]:.4f}, std={stats['sla'][1]:.4f}")
 
     # Save
     npz_path = os.path.join(data_dir, "normalization_stats.npz")
     np.savez(npz_path,
              ssta_mean=stats['ssta'][0], ssta_std=stats['ssta'][1],
              u10_mean=stats['u10'][0], u10_std=stats['u10'][1],
-             v10_mean=stats['v10'][0], v10_std=stats['v10'][1])
+             v10_mean=stats['v10'][0], v10_std=stats['v10'][1],
+             sla_mean=stats['sla'][0], sla_std=stats['sla'][1])
     print(f"  Saved: {npz_path}")
 
     ds_ssta.close()
@@ -150,7 +163,7 @@ def compute_normalization_stats(data_dir, train_mask=None):
 
 
 def build_data_array(data_dir, stats=None):
-    """Load SSTA + Wind, mask land→0, normalize, stack into (T, lat, lon, 3).
+    """Load SSTA + Wind + SLA, mask land→0, normalize, stack into (T, lat, lon, 4).
 
     Returns the consolidated array + ocean mask.
     """
@@ -158,42 +171,55 @@ def build_data_array(data_dir, stats=None):
 
     ssta_path = os.path.join(data_dir, "ssta.nc")
     wind_path = os.path.join(data_dir, "Wind_cropped.nc")
+    sla_path  = os.path.join(data_dir, "SLA_cropped.nc")
     mask_path = os.path.join(data_dir, "mask.npy")
 
     ds_ssta = xr.open_dataset(ssta_path)
     ds_wind = xr.open_dataset(wind_path)
+    ds_sla  = xr.open_dataset(sla_path)
     mask = np.load(mask_path).astype(np.float32)
 
-    ssta = ds_ssta['ssta'].values.astype(np.float32)   # (8035, 161, 241)
-    u10 = ds_wind['u10'].values.astype(np.float32)
-    v10 = ds_wind['v10'].values.astype(np.float32)
+    ssta = ds_ssta['ssta'].values.astype(np.float32)   # (T, 161, 241)
+    u10  = ds_wind['u10'].values.astype(np.float32)
+    v10  = ds_wind['v10'].values.astype(np.float32)
+    sla  = ds_sla['sla'].values.astype(np.float32)      # (T, 161, 241)
     years = ds_ssta.valid_time.dt.year.values
 
     ds_ssta.close()
     ds_wind.close()
+    ds_sla.close()
 
-    print(f"  Raw shapes: ssta={ssta.shape}, u10={u10.shape}, v10={v10.shape}")
+    # Verify time alignment
+    assert sla.shape[0] == ssta.shape[0], \
+        f"SLA time dim {sla.shape[0]} != SSTA {ssta.shape[0]}"
+
+    print(f"  Raw shapes: ssta={ssta.shape}, u10={u10.shape}, v10={v10.shape}, sla={sla.shape}")
 
     # ── Normalize FIRST (ocean-only stats, land gets arbitrary values) ──
     if stats is None:
         stats = compute_normalization_stats(data_dir)
 
     ssta = (ssta - stats['ssta'][0]) / stats['ssta'][1]
-    u10 = (u10 - stats['u10'][0]) / stats['u10'][1]
-    v10 = (v10 - stats['v10'][0]) / stats['v10'][1]
+    u10  = (u10  - stats['u10'][0]) / stats['u10'][1]
+    v10  = (v10  - stats['v10'][0]) / stats['v10'][1]
+    sla  = (sla  - stats['sla'][0]) / stats['sla'][1]
 
     # ── Mask land → 0 AFTER normalize (guarantees land ≡ 0) ──
-    # If mask is applied before normalize, land wind becomes (0-mean)/std ≠ 0
     ssta = np.where(mask, ssta, 0.0)
-    u10 = np.where(mask, u10, 0.0)
-    v10 = np.where(mask, v10, 0.0)
+    u10  = np.where(mask, u10,  0.0)
+    v10  = np.where(mask, v10,  0.0)
+    # SLA: mask land AND NaN (coastal altimetry gaps) to 0
+    sla  = np.where((mask > 0) & ~np.isnan(sla), sla, 0.0)
     n_land = int((mask == 0).sum())
+    n_sla_nan = int(((mask > 0) & np.isnan(sla)).sum())
     print(f"  Land cells set to 0: {n_land}")
+    print(f"  SLA ocean NaN cells: {n_sla_nan}")
     print(f"  Normalized: ssta∈[{ssta.min():.2f},{ssta.max():.2f}], "
-          f"u10∈[{u10.min():.2f},{u10.max():.2f}], v10∈[{v10.min():.2f},{v10.max():.2f}]")
+          f"u10∈[{u10.min():.2f},{u10.max():.2f}], v10∈[{v10.min():.2f},{v10.max():.2f}], "
+          f"sla∈[{sla[sla!=0].min():.2f},{sla.max():.2f}]")
 
     # ── Stack channels ──
-    data = np.stack([ssta, u10, v10], axis=-1)  # (T, 161, 241, 3)
+    data = np.stack([ssta, u10, v10, sla], axis=-1)  # (T, 161, 241, 4)
     print(f"  Final data shape: {data.shape} ({data.nbytes/1e9:.2f} GB)")
 
     return data, mask, years
@@ -221,19 +247,24 @@ def build_dataloaders(data_dir=None, batch_size=2, num_workers=4, stats=None):
 
     print("=" * 60)
     print("  NW Pacific Dataset Builder")
-    print(f"  Input: {INPUT_LEN}d  →  Output: {PRED_LEN}d")
+    print(f"  Input: {INPUT_LEN}d × 4 channels [ssta,u10,v10,sla]  →  Output: {PRED_LEN}d × 1 channel [ssta]")
     print("=" * 60)
 
     # ── Load stats if already computed ──
     npz_path = os.path.join(data_dir, "normalization_stats.npz")
     if stats is None and os.path.exists(npz_path):
         s = np.load(npz_path)
-        stats = {
-            'ssta': (float(s['ssta_mean']), float(s['ssta_std'])),
-            'u10': (float(s['u10_mean']), float(s['u10_std'])),
-            'v10': (float(s['v10_mean']), float(s['v10_std'])),
-        }
-        print(f"  Loaded normalization stats from {npz_path}")
+        if 'sla_mean' not in s:
+            # Old stats without SLA → recompute
+            print("  Old normalization stats (no SLA), recomputing ...")
+        else:
+            stats = {
+                'ssta': (float(s['ssta_mean']), float(s['ssta_std'])),
+                'u10':  (float(s['u10_mean']),  float(s['u10_std'])),
+                'v10':  (float(s['v10_mean']),  float(s['v10_std'])),
+                'sla':  (float(s['sla_mean']),  float(s['sla_std'])),
+            }
+            print(f"  Loaded normalization stats from {npz_path}")
 
     # ── Build unified data array ──
     data, mask, years = build_data_array(data_dir, stats=stats)
