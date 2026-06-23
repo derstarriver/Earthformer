@@ -9,7 +9,7 @@ Usage:
     python scripts/cuboid_transformer/nwp_sst/train_nwp_sst.py \
     --gpus 1 --save nwp_exp1 --data_dir datasets/SST-PREDICT/ \
     --cfg scripts/cuboid_transformer/nwp_sst/cfg_nwp.yaml
-
+13123
 
  # 断点续训
 python scripts/cuboid_transformer/nwp_sst/train_nwp_sst.py \
