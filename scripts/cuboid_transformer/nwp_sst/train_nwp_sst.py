@@ -20,7 +20,8 @@ python scripts/cuboid_transformer/nwp_sst/train_nwp_sst.py \
 # 测试
 python scripts/cuboid_transformer/nwp_sst/train_nwp_sst.py \
     --gpus 1 --test --save nwp_exp1 --data_dir datasets/SST-PREDICT/ \
-    --ckpt_name last.ckpt
+    --ckpt_name /home/lab/zhangxm/gxy/Earthformer/scripts/cuboid_transformer/nwp_sst/experiments/nwp_exp1/checkpoints/model-epoch=051.ckpt \
+    --cfg scripts/cuboid_transformer/nwp_sst/cfg_nwp.yaml
 
 
 """
@@ -404,7 +405,7 @@ class NWPPredictionModule(pl.LightningModule):
 
     # ── Forward ──
     def forward(self, X, mask):
-        """X: (B, 14, 161, 241, 3) → pred: (B, 3, 161, 241, 1)"""
+        """X: (B, 14, 161, 241, 4) → pred: (B, 3, 161, 241, 1)"""
         return self.torch_nn_module(X)
 
     def training_step(self, batch, batch_idx):
@@ -412,7 +413,7 @@ class NWPPredictionModule(pl.LightningModule):
         pred = self(X, mask)
         B, T = pred.shape[0], pred.shape[1]
         mask_t = mask.reshape(B, 1, mask.shape[1], mask.shape[2], 1)
-        loss = ((pred - Y) ** 2 * mask_t).sum() / (mask.sum() * T)
+        loss = ((pred - Y) ** 2 * mask_t).sum() / (mask.sum() * B * T)
         self.log('train_loss', loss, on_step=True, on_epoch=True)
         return loss
 
@@ -421,7 +422,7 @@ class NWPPredictionModule(pl.LightningModule):
         pred = self(X, mask)
         B, T = pred.shape[0], pred.shape[1]
         mask_t = mask.reshape(B, 1, mask.shape[1], mask.shape[2], 1)
-        loss = ((pred - Y) ** 2 * mask_t).sum() / (mask.sum() * T)
+        loss = ((pred - Y) ** 2 * mask_t).sum() / (mask.sum() * B * T)
 
         # Metrics over ocean only
         pred_ocean = pred * mask_t

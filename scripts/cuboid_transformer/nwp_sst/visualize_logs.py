@@ -8,7 +8,7 @@ Usage:
     # All plots (training curves + test bar + prediction sample)
     python scripts/cuboid_transformer/nwp_sst/visualize_logs.py \
         --exp_dir /home/lab/zhangxm/gxy/Earthformer/scripts/cuboid_transformer/nwp_sst/experiments/nwp_exp1/ \
-        --ckpt_path /home/lab/zhangxm/gxy/Earthformer/scripts/cuboid_transformer/nwp_sst/experiments/nwp_exp1/checkpoints/last.ckpt \
+        --ckpt_path /home/lab/zhangxm/gxy/Earthformer/scripts/cuboid_transformer/nwp_sst/experiments/nwp_exp1/checkpoints/model-epoch=063.ckpt \
         --data_dir datasets/SST-PREDICT/ \
         --save experiment_summary
 
@@ -159,28 +159,80 @@ def plot_prediction(ckpt_path, data_dir, save_path):
                 pad = torch.zeros(v.shape[0], 1, v.shape[2], v.shape[3])
                 sd[k] = torch.cat([v, pad], dim=1)
 
-    from earthformer.cuboid_transformer.cuboid_transformer import CuboidTransformerModel
-    model = CuboidTransformerModel(
-        input_shape=(14, 161, 241, 4), target_shape=(3, 161, 241, 1),
-        base_units=64, scale_alpha=1.0,
-        enc_depth=[2, 2, 2], dec_depth=[2, 2, 2],
-        enc_use_inter_ffn=True, dec_use_inter_ffn=True, dec_hierarchical_pos_embed=True,
-        downsample=2, downsample_type="patch_merge", upsample_type="upsample",
-        enc_attn_patterns=["axial", "spatial_lg_8", "divided_st"],
-        dec_self_attn_patterns=["axial", "spatial_lg_8", "divided_st"],
-        dec_cross_attn_patterns=["cross_1x1"] * 3,
-        dec_use_first_self_attn=False,
-        num_heads=4, attn_drop=0.1, proj_drop=0.1, ffn_drop=0.1,
-        ffn_activation="gelu", norm_layer="layer_norm", padding_type="zeros",
-        pos_embed_type="t+h+w", use_relative_pos=True,
-        self_attn_use_final_proj=True, z_init_method="zeros",
-        num_global_vectors=8,
-        use_dec_self_global=True, dec_self_update_global=True,
-        use_dec_cross_global=True, use_global_vector_ffn=True,
-        initial_downsample_type="conv", initial_downsample_activation="leaky",
-        initial_downsample_scale=[1, 4, 4],
-        initial_downsample_conv_layers=3, final_upsample_conv_layers=2, checkpoint_level=0,
+    # Read model arch from experiment's cfg.yaml (no hardcoding)
+    from omegaconf import OmegaConf
+    ckpt_dir = os.path.dirname(os.path.realpath(ckpt_path))
+    exp_dir = os.path.dirname(ckpt_dir)
+    cfg_path = os.path.join(exp_dir, "cfg.yaml")
+    if not os.path.exists(cfg_path):
+        raise FileNotFoundError(f"cfg.yaml not found: {cfg_path}")
+    mc = OmegaConf.load(cfg_path).model
+    n_blocks = len(mc.enc_depth)
+
+    def _resolve(key):
+        val = mc.get(key)
+        if val is None:
+            return None
+        if isinstance(val, str):
+            return [val] * n_blocks
+        return list(val)
+
+    model_kw = dict(
+        input_shape=tuple(mc.input_shape),
+        target_shape=tuple(mc.target_shape),
+        base_units=mc.base_units,
+        scale_alpha=mc.scale_alpha,
+        enc_depth=list(mc.enc_depth),
+        dec_depth=list(mc.dec_depth),
+        enc_use_inter_ffn=mc.enc_use_inter_ffn,
+        dec_use_inter_ffn=mc.dec_use_inter_ffn,
+        dec_hierarchical_pos_embed=mc.dec_hierarchical_pos_embed,
+        downsample=mc.downsample,
+        downsample_type=mc.downsample_type,
+        enc_attn_patterns=_resolve("self_pattern"),
+        dec_self_attn_patterns=_resolve("cross_self_pattern"),
+        dec_cross_attn_patterns=_resolve("cross_pattern"),
+        dec_cross_last_n_frames=mc.get("dec_cross_last_n_frames"),
+        dec_use_first_self_attn=mc.dec_use_first_self_attn,
+        num_heads=mc.num_heads,
+        attn_drop=mc.attn_drop,
+        proj_drop=mc.proj_drop,
+        ffn_drop=mc.ffn_drop,
+        upsample_type=mc.upsample_type,
+        ffn_activation=mc.ffn_activation,
+        gated_ffn=mc.get("gated_ffn", False),
+        norm_layer=mc.norm_layer,
+        num_global_vectors=mc.num_global_vectors,
+        use_dec_self_global=mc.use_dec_self_global,
+        dec_self_update_global=mc.dec_self_update_global,
+        use_dec_cross_global=mc.use_dec_cross_global,
+        use_global_vector_ffn=mc.use_global_vector_ffn,
+        use_global_self_attn=mc.get("use_global_self_attn", False),
+        separate_global_qkv=mc.get("separate_global_qkv", False),
+        global_dim_ratio=mc.get("global_dim_ratio", 1),
+        initial_downsample_type=mc.initial_downsample_type,
+        initial_downsample_activation=mc.initial_downsample_activation,
+        initial_downsample_scale=list(mc.initial_downsample_scale),
+        initial_downsample_conv_layers=mc.initial_downsample_conv_layers,
+        final_upsample_conv_layers=mc.final_upsample_conv_layers,
+        padding_type=mc.padding_type,
+        z_init_method=mc.z_init_method,
+        checkpoint_level=mc.get("checkpoint_level", 0),
+        pos_embed_type=mc.pos_embed_type,
+        use_relative_pos=mc.use_relative_pos,
+        self_attn_use_final_proj=mc.self_attn_use_final_proj,
+        attn_linear_init_mode=mc.get("attn_linear_init_mode", "0"),
+        ffn_linear_init_mode=mc.get("ffn_linear_init_mode", "0"),
+        conv_init_mode=mc.get("conv_init_mode", "0"),
+        down_up_linear_init_mode=mc.get("down_up_linear_init_mode", "0"),
+        norm_init_mode=mc.get("norm_init_mode", "0"),
     )
+    print(f"  Model from cfg.yaml: scale_alpha={model_kw['scale_alpha']}, "
+          f"downsample_scale={model_kw['initial_downsample_scale']}, "
+          f"enc_depth={model_kw['enc_depth']}")
+
+    from earthformer.cuboid_transformer.cuboid_transformer import CuboidTransformerModel
+    model = CuboidTransformerModel(**model_kw)
     model.load_state_dict(sd, strict=True)
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     model = model.to(device).eval()

@@ -46,7 +46,7 @@ class NWPacificDataset(Dataset):
     demand without copying the full dataset.
     """
 
-    def __init__(self, data, mask, input_len=14, pred_len=3):
+    def __init__(self, data, mask, input_len=14, pred_len=3, stride=1):
         """
         Parameters
         ----------
@@ -54,33 +54,35 @@ class NWPacificDataset(Dataset):
             Pre-masked & normalized data.
         mask: np.ndarray, shape (lat, lon)
             Ocean mask (1=ocean, 0=land).
+        stride: int
+            Sliding window step size (1 = every day, 3 = every 3 days, etc.)
         """
         super().__init__()
-        self.data = data                     # reference, no copy
+        self.data = data
         self.mask = mask
         self.input_len = input_len
         self.pred_len = pred_len
         self.total_len = input_len + pred_len
-        self.n_samples = data.shape[0] - self.total_len + 1
+        self.stride = stride
+        self.n_samples = (data.shape[0] - self.total_len) // stride + 1
 
         if self.n_samples <= 0:
             raise ValueError(
                 f"Data length {data.shape[0]} too short for "
                 f"input_len={input_len} + pred_len={pred_len}")
 
-        # Memory usage
         size_gb = data.nbytes / 1e9
-        print(f"  Dataset: {self.n_samples:,} samples, "
+        print(f"  Dataset: {self.n_samples:,} samples (stride={stride}), "
               f"data={data.shape}, {size_gb:.2f} GB (in-memory)")
 
     def __len__(self):
         return self.n_samples
 
     def __getitem__(self, idx):
-        # Slice from backing array (creates a view → copy to tensor)
-        seq = self.data[idx:idx + self.total_len]            # (17, 161, 241, C)
-        x = np.ascontiguousarray(seq[:self.input_len])       # (14, 161, 241, C)
-        y = np.ascontiguousarray(seq[self.input_len:, ..., 0:1])  # (3, 161, 241, 1) — ssta only
+        start = idx * self.stride
+        seq = self.data[start:start + self.total_len]            # (17, 161, 241, C)
+        x = np.ascontiguousarray(seq[:self.input_len])           # (14, 161, 241, C)
+        y = np.ascontiguousarray(seq[self.input_len:, ..., 0:1]) # (3, 161, 241, 1) — ssta only
 
         return (
             torch.from_numpy(x),
@@ -284,9 +286,9 @@ def build_dataloaders(data_dir=None, batch_size=2, num_workers=4, stats=None):
 
     # ── Build Dataset (in-memory, lazy window) ──
     print_step("Building Datasets ...")
-    train_ds = NWPacificDataset(data[train_idx], mask, INPUT_LEN, PRED_LEN)
-    val_ds = NWPacificDataset(data[val_idx], mask, INPUT_LEN, PRED_LEN)
-    test_ds = NWPacificDataset(data[test_idx], mask, INPUT_LEN, PRED_LEN)
+    train_ds = NWPacificDataset(data[train_idx], mask, INPUT_LEN, PRED_LEN, stride=3)
+    val_ds   = NWPacificDataset(data[val_idx], mask, INPUT_LEN, PRED_LEN, stride=1)
+    test_ds  = NWPacificDataset(data[test_idx], mask, INPUT_LEN, PRED_LEN, stride=1)
 
     # ── DataLoaders ──
     print_step("Building DataLoaders ...")

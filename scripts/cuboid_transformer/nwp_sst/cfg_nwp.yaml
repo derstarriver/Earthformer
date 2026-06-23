@@ -21,14 +21,14 @@ optim:
   lr: 0.0001
   wd: 1.0e-04
   gradient_clip_val: 1.0
-  max_epochs: 50
+  max_epochs: 100
   lr_scheduler_mode: "cosine"
   min_lr_ratio: 1.0e-3
   warmup_min_lr_ratio: 0.0
   warmup_percentage: 0.1
   early_stop: true
   early_stop_mode: "min"
-  early_stop_patience: 10
+  early_stop_patience: 30
   save_top_k: 3
 
 logging:
@@ -51,7 +51,7 @@ model:
   input_shape: [14, 161, 241, 4]
   target_shape: [3, 161, 241, 1]
   base_units: 64
-  scale_alpha: 1.0
+  scale_alpha: 0.4
   enc_depth: [2, 2, 2]
   dec_depth: [2, 2, 2]
   enc_use_inter_ffn: true
