@@ -2,7 +2,7 @@
 """Persistence baseline for NW Pacific SSTA prediction.
 
 Uses the last input-day SSTA as the prediction for all future days:
-    pred[t] = X[last_day, :, :, ssta_channel]   for t = 1, 2, 3
+    pred[t] = X[last_day, :, :, ssta_channel]   for all lead days
 
 Computes EXACTLY the same test metrics as Earthformer's test_epoch_end
 (identical accumulation, aggregation, and degC conversion).
@@ -41,38 +41,39 @@ def main():
     print(f"Test samples: {n_test_samples}\n")
 
     # ── Accumulate metrics — identical to Earthformer test_step/test_epoch_end ──
-    # Get device from first batch
-    X_sample, _, _ = next(iter(test_loader))
+    # Get device and T_out from first batch
+    X_sample, Y_sample, _ = next(iter(test_loader))
     device = X_sample.device
+    T_out = Y_sample.shape[1]
 
-    sq_err_sum = torch.zeros(3, device=device)
-    abs_err_sum = torch.zeros(3, device=device)
+    sq_err_sum = torch.zeros(T_out, device=device)
+    abs_err_sum = torch.zeros(T_out, device=device)
     n_ocean_total = 0.0
 
     print("Computing persistence baseline ...")
     for X, Y, mask in test_loader:
         X, Y, mask = X.to(device), Y.to(device), mask.to(device)
-        B, T_out = Y.shape[0], Y.shape[1]
+        B = Y.shape[0]
 
         # ── Persistence: broadcast last SSTA to all output days ──
         last_ssta = X[:, -1:, :, :, 0:1]               # (B, 1, 161, 241, 1)
-        pred = last_ssta.expand(-1, T_out, -1, -1, -1)  # (B, 3, 161, 241, 1) — no copy
+        pred = last_ssta.expand(-1, T_out, -1, -1, -1)  # (B, T_out, 161, 241, 1) — no copy
 
         # ── Ocean mask (identical to Earthformer test_step line 447) ──
         mask_t = mask.reshape(B, 1, mask.shape[1], mask.shape[2], 1)
 
         # Per-day accumulation (identical to Earthformer test_step lines 448-451)
-        sq_err = ((pred - Y) ** 2 * mask_t).sum(dim=(0, 2, 3, 4))   # (T,) sum over B,H,W,C
-        abs_err = ((pred - Y).abs() * mask_t).sum(dim=(0, 2, 3, 4))  # (T,)
+        sq_err = ((pred - Y) ** 2 * mask_t).sum(dim=(0, 2, 3, 4))   # (T_out,) sum over B,H,W,C
+        abs_err = ((pred - Y).abs() * mask_t).sum(dim=(0, 2, 3, 4))  # (T_out,)
         n_ocean = mask_t.sum().item()  # sum all dims → B × ocean_pixels_per_sample
 
         sq_err_sum += sq_err
         abs_err_sum += abs_err
         n_ocean_total += n_ocean
 
-    # ── Compute metrics (identical to Earthformer test_epoch_end lines 456-472) ──
-    mse_per_day = sq_err_sum / n_ocean_total   # (3,) normalized per-pixel MSE
-    mae_per_day = abs_err_sum / n_ocean_total  # (3,) normalized per-pixel MAE
+    # ── Compute metrics (identical to Earthformer test_epoch_end) ──
+    mse_per_day = sq_err_sum / n_ocean_total   # (T_out,) normalized per-pixel MSE
+    mae_per_day = abs_err_sum / n_ocean_total  # (T_out,) normalized per-pixel MAE
 
     mse_degC = mse_per_day * (ssta_std ** 2)
     rmse_degC = torch.sqrt(mse_degC)

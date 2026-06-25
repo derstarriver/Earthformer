@@ -29,8 +29,8 @@ DEFAULT_DATA_DIR = "datasets/SST-PREDICT"
 
 # ─── Task config ───
 INPUT_LEN = 14           # 14-day context
-PRED_LEN = 3             # 3-day forecast
-TOTAL_LEN = INPUT_LEN + PRED_LEN  # 17
+PRED_LEN = 7             # 7-day forecast
+TOTAL_LEN = INPUT_LEN + PRED_LEN  # 21
 
 # ─── Train/val/test split by year ───
 TRAIN_YEARS = (2001, 2022)

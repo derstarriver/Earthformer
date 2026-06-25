@@ -271,33 +271,40 @@ def plot_prediction(ckpt_path, data_dir, save_path):
         vmax = 1.0
     vmin = -vmax
 
-    fig, axes = plt.subplots(3, 3, figsize=(18, 15))
+    n_days = P_c.shape[0]
 
-    ax = axes[0, 0]
-    im = ax.imshow(X_c, cmap='RdBu_r', vmin=vmin, vmax=vmax, origin='lower',
-                   extent=[120, 180, 10, 50], aspect='auto')
-    ax.set_title('Input (last day) °C')
-    plt.colorbar(im, ax=ax, shrink=0.8)
+    # Dynamic layout: row 0 = input, rows 1..n_days = pred/true pairs
+    n_rows = 1 + n_days
+    fig, axes = plt.subplots(n_rows, 2, figsize=(14, 3.5 * n_rows))
 
-    for d in range(3):
-        for col, (data, label) in enumerate([(P_c[d], 'Pred'), (Y_c[d], 'True')], 1):
-            ax_d = axes[d, col]
+    # Input (last day) spanning both columns
+    ax_in = axes[0, 0]
+    im = ax_in.imshow(X_c, cmap='RdBu_r', vmin=vmin, vmax=vmax, origin='lower',
+                      extent=[120, 180, 10, 50], aspect='auto')
+    ax_in.set_title('Input (last day SSTA) °C')
+    plt.colorbar(im, ax=ax_in, shrink=0.8)
+    # Hide unused second axis in input row
+    axes[0, 1].set_visible(False)
+
+    for d in range(n_days):
+        for col, (data, label) in enumerate([(P_c[d], 'Pred'), (Y_c[d], 'True')]):
+            ax_d = axes[d + 1, col]
             im = ax_d.imshow(data, cmap='RdBu_r', vmin=vmin, vmax=vmax, origin='lower',
                              extent=[120, 180, 10, 50], aspect='auto')
             ax_d.set_title(f'Day +{d+1} ({label})')
             plt.colorbar(im, ax=ax_d, shrink=0.8)
 
-    rmse_d = [np.sqrt(np.nanmean((P_c[d] - Y_c[d]) ** 2)) for d in range(3)]
-    mae_d = [np.nanmean(np.abs(P_c[d] - Y_c[d])) for d in range(3)]
+    rmse_d = [np.sqrt(np.nanmean((P_c[d] - Y_c[d]) ** 2)) for d in range(n_days)]
+    mae_d = [np.nanmean(np.abs(P_c[d] - Y_c[d])) for d in range(n_days)]
     fig.suptitle(
-        f'SSTA Prediction — RMSE: {[f"{v:.3f}" for v in rmse_d]} °C  |  '
-        f'MAE: {[f"{v:.3f}" for v in mae_d]} °C', fontsize=12, y=1.01)
+        f'SSTA Prediction — RMSE(°C) avg={np.mean(rmse_d):.3f}  |  '
+        f'MAE(°C) avg={np.mean(mae_d):.3f}', fontsize=12, y=1.01)
     plt.tight_layout()
     fig.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.close(fig)
     print(f"  Saved: {save_path}")
-    print(f"    RMSE(°C): {[f'{v:.3f}' for v in rmse_d]}")
-    print(f"    MAE( °C): {[f'{v:.3f}' for v in mae_d]}")
+    print(f"    RMSE(°C) per day: {[f'{v:.3f}' for v in rmse_d]}")
+    print(f"    MAE( °C) per day: {[f'{v:.3f}' for v in mae_d]}")
     return save_path
 
 

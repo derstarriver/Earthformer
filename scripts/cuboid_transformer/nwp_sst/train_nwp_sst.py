@@ -2,7 +2,7 @@
 """Train Earthformer for NW Pacific daily SSTA prediction.
 1213132123132132
 Input:  14 days × 161×241 × 4 channels [ssta, u10, v10, sla]
-Output:  3 days × 161×241 × 1 channel  [ssta]
+Output:  7 days × 161×241 × 1 channel  [ssta]
 
 Usage:
     TRAIN
@@ -246,7 +246,7 @@ class NWPPredictionModule(pl.LightningModule):
         cfg = OmegaConf.create()
         cfg.data_channels = 4
         cfg.input_shape = (14, 161, 241, 4)
-        cfg.target_shape = (3, 161, 241, 1)
+        cfg.target_shape = (7, 161, 241, 1)
         cfg.base_units = 64
         cfg.scale_alpha = 1.0
         cfg.enc_depth = [2, 2, 2]
