@@ -1,7 +1,7 @@
 # Earthformer NW Pacific SSTA Prediction Config
 # Input:  (14, 161, 241, 4) = 14 days × 4 channels (ssta, u10, v10, sla)
 # Output: (7, 161, 241, 1)  =  7 days × 1 channel  (ssta)
-#twset13132
+#twset1313213213515
 
 dataset:
   data_dir: "datasets/SST-PREDICT/"
