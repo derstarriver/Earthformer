@@ -6,9 +6,19 @@ Output:  7 days × 161×241 × 1 channel  [ssta]
 
 Usage:
     TRAIN
+
+    14-3
     python scripts/cuboid_transformer/nwp_sst/train_nwp_sst.py \
     --gpus 1 --save nwp_exp1 --data_dir datasets/SST-PREDICT/ \
     --cfg scripts/cuboid_transformer/nwp_sst/cfg_nwp.yaml
+
+
+
+    14-7
+    python scripts/cuboid_transformer/nwp_sst/train_nwp_sst.py \
+    --gpus 1 --save nwp_7day --data_dir datasets/SST-PREDICT/ \
+    --cfg scripts/cuboid_transformer/nwp_sst/cfg_nwp.yaml
+
 13123
 
  # 断点续训
@@ -17,13 +27,30 @@ python scripts/cuboid_transformer/nwp_sst/train_nwp_sst.py \
     --cfg scripts/cuboid_transformer/nwp_sst/cfg_nwp.yaml \
     --ckpt_name last.ckpt
 
+
+?
+        python scripts/cuboid_transformer/nwp_sst/train_nwp_sst.py \
+    --gpus 1 --save nwp_7day --data_dir datasets/SST-PREDICT/ \
+    --cfg scripts/cuboid_transformer/nwp_sst/cfg_nwp.yaml
+    --ckpt_name /home/gmm/zjj/gxy/Earthformer1/scripts/cuboid_transformer/nwp_sst/experiments/nwp_7day/checkpoints/last.ckpt
+
+python scripts/cuboid_transformer/nwp_sst/train_nwp_sst.py \
+    --gpus 1 --save nwp_7day --data_dir datasets/SST-PREDICT/ \
+    --cfg scripts/cuboid_transformer/nwp_sst/cfg_nwp.yaml \
+    --ckpt_name last.ckpt
+
+
 # 测试
 python scripts/cuboid_transformer/nwp_sst/train_nwp_sst.py \
     --gpus 1 --test --save nwp_exp1 --data_dir datasets/SST-PREDICT/ \
     --ckpt_name /home/lab/zhangxm/gxy/Earthformer/scripts/cuboid_transformer/nwp_sst/experiments/nwp_exp1/checkpoints/model-epoch=051.ckpt \
     --cfg scripts/cuboid_transformer/nwp_sst/cfg_nwp.yaml
 
-
+# 测试（选最优 epoch）
+python scripts/cuboid_transformer/nwp_sst/train_nwp_sst.py \
+    --gpus 1 --test --save nwp_7day --data_dir datasets/SST-PREDICT/ \
+    --cfg scripts/cuboid_transformer/nwp_sst/cfg_nwp.yaml \
+    --ckpt_name model-epoch=066.ckpt
 """
 import warnings
 import os
