@@ -3,6 +3,10 @@
 # Output: (7, 161, 241, 1)  =  7 days × 1 channel  (ssta)
 #twset1313213213515
 
+
+#test fetch
+#=========================
+
 dataset:
   data_dir: "datasets/SST-PREDICT/"
   in_len: 14
