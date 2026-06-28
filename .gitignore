@@ -141,8 +141,7 @@ dmypy.json
 /scripts/cuboid_transformer/earthnet_w_meso/experiments/
 
 # local documents
-/docs/
-*.pptx
+
 
 # datasets
 /datasets/moving_mnist/
