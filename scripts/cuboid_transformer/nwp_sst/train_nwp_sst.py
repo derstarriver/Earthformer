@@ -441,7 +441,12 @@ class NWPPredictionModule(pl.LightningModule):
         B, T = pred.shape[0], pred.shape[1]
         mask_t = mask.reshape(B, 1, mask.shape[1], mask.shape[2], 1)
         loss = ((pred - Y) ** 2 * mask_t).sum() / (mask.sum() * B * T)
+        # Entropy regularization to prevent frequency band collapse
+        entropy_reg = self.torch_nn_module.freq_branch.entropy_loss(
+            self.torch_nn_module._freq_input)
+        loss = loss + 1e-4 * entropy_reg
         self.log('train_loss', loss, on_step=True, on_epoch=True)
+        self.log('entropy_reg', entropy_reg, on_step=False, on_epoch=True)
         return loss
 
     def validation_step(self, batch, batch_idx, dataloader_idx=0):

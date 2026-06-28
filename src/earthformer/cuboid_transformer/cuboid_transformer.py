@@ -17,6 +17,7 @@ from .utils import (
     get_activation, get_norm_layer,
     _generalize_padding, _generalize_unpadding,
     apply_initialization, round_to)
+from .spatial_frequency_branch import SpatialFrequencyBranch
 
 
 class PosEmbed(nn.Module):
@@ -2967,6 +2968,7 @@ class CuboidTransformerModel(nn.Module):
             down_linear_init_mode=down_up_linear_init_mode,
             norm_init_mode=norm_init_mode,
         )
+        self.freq_branch = SpatialFrequencyBranch(dim=base_units)
         self.enc_pos_embed = PosEmbed(
             embed_dim=base_units, typ=pos_embed_type,
             maxH=H_in, maxW=W_in, maxT=T_in)
@@ -3181,6 +3183,8 @@ class CuboidTransformerModel(nn.Module):
         B, _, _, _, _ = x.shape
         T_out = self.target_shape[0]
         x = self.initial_encoder(x)
+        self._freq_input = x
+        x = self.freq_branch(x)
         x = self.enc_pos_embed(x)
         if self.num_global_vectors > 0:
             init_global_vectors = self.init_global_vectors\
