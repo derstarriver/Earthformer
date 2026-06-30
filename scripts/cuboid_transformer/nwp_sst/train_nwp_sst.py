@@ -441,12 +441,22 @@ class NWPPredictionModule(pl.LightningModule):
         B, T = pred.shape[0], pred.shape[1]
         mask_t = mask.reshape(B, 1, mask.shape[1], mask.shape[2], 1)
         loss = ((pred - Y) ** 2 * mask_t).sum() / (mask.sum() * B * T)
-        # Entropy regularization to prevent frequency band collapse
-        entropy_reg = self.torch_nn_module.freq_branch.entropy_loss(
-            self.torch_nn_module._freq_input)
-        loss = loss + 1e-4 * entropy_reg
+
+        # Auxiliary loss: FFT branch direct SST prediction (downsampled target)
+        aux_pred = self.torch_nn_module._aux_pred                    # (B, Tout, H', W', 1)
+        target_ds = torch.nn.functional.adaptive_avg_pool3d(
+            Y.permute(0, 4, 1, 2, 3),                                # (B, C, Tout, H, W)
+            output_size=aux_pred.shape[1:4])                         # match (Tout, H', W')
+        target_ds = target_ds.permute(0, 2, 3, 4, 1)                # (B, Tout, H', W', 1)
+        aux_loss = torch.nn.functional.mse_loss(aux_pred, target_ds)
+
+        # Smoothness loss: anti spectral spike
+        smoothness_loss = self.torch_nn_module._loss_smooth
+
+        loss = loss + 0.2 * aux_loss + 0.01 * smoothness_loss
         self.log('train_loss', loss, on_step=True, on_epoch=True)
-        self.log('entropy_reg', entropy_reg, on_step=False, on_epoch=True)
+        self.log('aux_loss', aux_loss, on_step=False, on_epoch=True)
+        self.log('smoothness', smoothness_loss, on_step=False, on_epoch=True)
         return loss
 
     def validation_step(self, batch, batch_idx, dataloader_idx=0):
