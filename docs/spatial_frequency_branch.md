@@ -1,10 +1,24 @@
-# Spatial Frequency Branch — 设计文档
+# Forced Spectral Learning Branch -- 设计文档
 
 ## 动机
 
-西北太平洋 SSTA 预测涉及多种周期性海洋现象（中尺度涡旋、Rossby 波、Kelvin 波、季节循环、ENSO 遥相关），这些现象在频域具有清晰的物理签名。Earthformer 的 cuboid transformer 通过注意力机制隐式学习这些模式，但缺乏显式的频域结构表示。
+西北太平洋 SSTA 预测涉及多种具有清晰频域签名的海洋现象（中尺度涡旋、Rossby 波、Kelvin 波、季节循环、ENSO 遥相关）。Earthformer 的 cuboid transformer 通过注意力隐式学习这些模式，但 attention 固有的低频偏好（softmax 平滑效应）使其容易丢失中高频细节（涡旋边界、锋面梯度）。
 
-本模块在 InitialEncoder 之后插入一个轻量频率分支，用 **~6K 参数（<0.06%）** 提供显式的、物理可解释的频域增强。
+本模块实现 **Forced Spectral Learning**：用 FFT 提取中高频残差，以固定权重注入 encoder 输入特征，改变 QKV 计算结果，从而结构性改写 attention pattern。模块不可被 bypass。
+
+**参数量: ~28K (0.28%)**。
+
+## 与 V4 (SpatialFrequencyBranch) 的关键区别
+
+| 维度 | V4 (旧) | V5 (当前) |
+|------|---------|----------|
+| 注入方式 | `x + alpha * freq_out`, alpha=0 init | `x + 0.3 * freq_delta`, 固定 beta=0.3 |
+| 旁路风险 | alpha=0 时等价无分支 | 不可旁路 |
+| 频谱选择 | 全频段处理 | soft band-pass, 偏高频 |
+| State conditioner | band_w only | band_w (选择) + influence (强度) 解耦 |
+| 梯度路径 | 仅 residual add | aux_head 直接梯度 + encoder QKV 梯度 |
+| 正则化 | entropy_reg (防collapse) | smoothness_loss (防孤峰) |
+| 输入连接 | 不 detach | 不 detach, 全梯度 |
 
 ## 插入位置
 
@@ -12,325 +26,242 @@
 Input (B, 14, 161, 241, 4)
   ↓
 InitialEncoder (Conv + PatchMerge)
-  ↓ → (B, 14, 41, 61, 64)
-  ↓
-★★★ SpatialFrequencyBranch ★★★
-  ↓ → (B, 14, 41, 61, 64)  形状不变
+  ↓ -> x: (B, 14, H', W', D)
+  │
+  ├── ForcedSpectralBranch ──> freq_delta
+  │       │
+  │       ├──> aux_head ──> aux_pred (aux loss, lambda=0.2)
+  │       └──> smoothness_loss        (lambda=0.01)
+  │
+  ▼
+x = x + 0.3 * freq_delta    <-- 固定权重, 不可旁路
   ↓
 enc_pos_embed
   ↓
-Encoder → Decoder → ...
+Encoder (QKV 计算含频率信息) -> Decoder -> Prediction
+  ↓
+total_loss = main + 0.2*aux + 0.01*smoothness
 ```
-
-选择在 InitialEncoder 之后、enc_pos_embed 之前插入的理由：
-- 空间已降至 41×61，FFT 计算量合理
-- 在位置嵌入之前，让频率增强后的特征再获得空间位置信息
-- 在编码器之前，transformer 注意力可以利用增强后的特征
 
 ## 架构
 
 ```
-x: (B, T, H, W, D=64)
+x: (B, T, H, W, D=64)                    无 detach, 全梯度
   │
-  ├─────────────────────────────────────────────────┐              
-  │                                                 │              
-  ▼                                                 │              
-  │ rFFT2(H, W)                                     │              
-  │    X_f: (B, T, H, W_f, D) complex               │              
-  │    amp = |X_f|, phase = ∠X_f                    │              
-  │                                                 │              
-  │ ┌─ State Conditioner ─────────────────────────┐ │              
-  │ │  x → chunk(4, dim=-1) ⊲ 4 groups of 16 chs  │ │              
-  │ │    → per-group GlobalAvgPool(T,H,W)          │ │              
-  │ │    → concat → MLP(64→16→K)                  │ │              
-  │ │    → softmax → band_w: (B, K)               │ │              
-  │ └──────────────────────────────────────────────┘ │              
-  │                     │                            │              
-  │                     ▼                            │              
-  │ ┌─ Spectral Gating ───────────────────────────┐ │              
-  │ │  profile[k,h,w]  ∈ R^K×H×W_f (learnable)   │ │              
-  │ │  gate[k,d]       ∈ R^K×D     (learnable)    │ │              
-  │ │                                              │ │              
-  │ │  logits[b,h,w,d,k] = band_w[b,k]            │ │              
-  │ │                    × profile[k,h,w]          │ │              
-  │ │                    × σ(gate[k,d])            │ │              
-  │ │                                              │ │              
-  │ │  attn = softmax_k(logits)    ⊲ 频段间归一化   │ │              
-  │ │  weight[b,h,w,d] = Σ_k attn × profile[k,h,w] │ │              
-  │ └──────────────────────────────────────────────┘ │              
-  │                     │                            │              
-  │                     ▼                            │              
-  │ amp'  = amp ⊙ weight          ⊲ 频域直接 gating  │              
-  │ X'    = amp' × exp(i·phase)   ⊲ 原相位重建       │              
-  │ freq  = irfft2(X')            ⊲ 回到空域         │              
-  │                                                 │              
-  │                     ▼                            │              
-  └───── output = x + α × freq_out ─────────────────┘              
-  α: learnable scalar, init=0 → 训练初期分支无影响
+  ▼
+  │ rFFT2(H, W)
+  │    X_f: (B, T, H, W_f, D) complex
+  │    amp = |X_f|, phase = angle(X_f)
+  │
+  │ ┌─ Soft band-pass (radius -> freq_weight) ────────┐
+  │ │  r = sqrt(h_f^2 + w_f^2)  [frequency radius]     │
+  │ │  r_norm in [0, 1]                                 │
+  │ │  freq_weight = sigmoid(MLP(r_norm))  in (0,1)    │
+  │ │    init: DC ~0.2, Nyquist ~0.7                    │
+  │ │    -> 高频初权重高, 低频可被数据拉回               │
+  │ └──────────────────────────────────────────────────┘
+  │                     │
+  │                     ▼
+  │ ┌─ State Conditioner (two decoupled heads) ────────┐
+  │ │  x -> chunk(4, dim=-1)  4 groups of 16 chs       │
+  │ │    -> per-group GlobalAvgPool(T,H,W)              │
+  │ │    -> concat -> Linear(64->16) -> context         │
+  │ │                                                   │
+  │ │  band_w  = softmax(Linear_sel(context))  (B,K)   │
+  │ │    -> "which band" to activate                    │
+  │ │  influence = sigmoid(Linear_str(context)) (B,K)  │
+  │ │    -> "how much" modulation                       │
+  │ │  band_w = band_w * (0.5 + influence)              │
+  │ │    -> range [0.25, 1.25], init ~0.5               │
+  │ └──────────────────────────────────────────────────┘
+  │                     │
+  │                     ▼
+  │ ┌─ Spectral Gating ───────────────────────────────┐
+  │ │  profile[k,h,w] in R^{K x H x W_f} (learnable)  │
+  │ │  gate[k,d]      in R^{K x D}     (learnable)    │
+  │ │                                                   │
+  │ │  logits[b,k,h,w,d] = band_w[b,k]                 │
+  │ │                    x profile[k,h,w]               │
+  │ │                    x sigmoid(gate[k,d])           │
+  │ │  attn_b = softmax_k(logits)    频段间归一化       │
+  │ │  spectral_w[b,h,w,d] = sum_k attn_b * profile    │
+  │ │                                                   │
+  │ │  weight = spectral_w * freq_weight[h,w]          │
+  │ │    -> 同时考虑 band gating (选择什么频段)          │
+  │ │       和 band-pass (高低频偏好)                   │
+  │ └──────────────────────────────────────────────────┘
+  │                     │
+  │                     ▼
+  │ amp'  = amp * weight             频域直接 gating
+  │ X'    = amp' * exp(i*phase)      原相位重建
+  │ freq_delta = irfft2(X')          回到空域 (B,T,H,W,D)
+  │
+  │ ┌─ Auxiliary Head ───────────────────────────────┐
+  │ │  Conv3d(D->D/2, (T_in-T_out+1,1,1))  T压缩     │
+  │ │  Conv3d(D/2->D/4, 3x3)                         │
+  │ │  Conv3d(D/4->C_out, 1x1)                        │
+  │ │  -> aux_pred: (B, Tout, H, W, C_out)            │
+  │ └──────────────────────────────────────────────────┘
+  │
+  │ ┌─ Smoothness Loss ──────────────────────────────┐
+  │ │  |freq_delta_fft| mean over T,D -> (H, W_f)    │
+  │ │  h_diff = mean((amp[1:,:]-amp[:-1,:])^2)        │
+  │ │  w_diff = mean((amp[:,1:]-amp[:,:-1])^2)        │
+  │ │  loss = 0.01 * (h_diff + w_diff)                │
+  │ │  -> 防频谱孤峰, 不强制均匀分布                     │
+  │ └──────────────────────────────────────────────────┘
+  │
+  ▼
+return freq_delta, aux_pred, smoothness_loss
+
+
+外部 (CuboidTransformerModel.forward):
+  x = x + 0.3 * freq_delta       <-- QKV 自然包含频率信息
+  x = enc_pos_embed(x)
+  mem_l = encoder(x)              <-- K = W_k(x + 0.3*freq_delta)
+                                       = W_k(x) + 0.3*W_k(freq_delta)
+                                       等效于 attention logit bias
 ```
 
 ## 核心设计决策
 
-### 1. 仅 2D 空间 FFT（不做时间维度）
-
-输入窗口仅 14 天，时间 FFT 频率分辨率极低（7 个频率分量）。空间域有 41×61 ≈ 2500 个频率分量，才是信息丰富的维度。未来若输入扩展至 28 天可重新评估 3D FFT。
-
-### 2. 仅处理振幅，保留原始相位
-
-相位在训练初期极易不稳定。保留 `torch.angle` 原值不动，仅对 `|X_f|` 做 gating，训练稳定性远优于振幅+相位联合处理。
-
-### 3. State-conditioned（非 radius-conditioned）
-
-频率分配不应由网格坐标决定，而应由海洋状态决定。
-
-```
-radius-based（不推荐）:   所有样本共享同一个频率分配
-state-conditioned（采用）: GlobalAvgPool → 编码流域级状态 → 每样本动态分配
-```
-
-| 海洋状态 | band 激活模式 |
-|---------|-------------|
-| El Niño 成熟期 | 低频主导（流域级 ENSO 信号） |
-| 涡旋活跃区 | 中频主导（中尺度涡旋） |
-| 台风过境 | 高频增强（小尺度强混合） |
-
-### 4. Channel-group split（物理分组）
-
-将 64 通道等分为 4 组（16×4），分别池化后拼接入 MLP：
-
-```
-group_0 (SSTA-like)  → z0
-group_1 (U10-like)   → z1
-group_2 (V10-like)   → z2
-group_3 (SLA-like)   → z3
-        ↓
-  concat → MLP → band_w
-```
-
-即使 InitialEncoder 已做跨通道混合，分组后的子空间仍保留对不同物理变量的敏感性，使 state conditioning 更具物理意义。
-
-### 5. Softmax 频段间归一化（非无界加法）
-
-```
-weight = 1 + Σ(...)  → 无界，振幅可能爆炸或坍缩
-softmax_k(logits)    → 有界，天然频率守恒，训练稳定
-```
-
-### 6. Entropy 正则（防 single-band collapse）
+### 1. x = x + beta * freq_delta, beta=0.3 固定（不可旁路）
 
 ```python
-loss_entropy = 1e-4 × (log(K) + Σ_k band_w[k] × log(band_w[k] + ε))
+# 旧 (V4, 可旁路):
+output = x + alpha * freq_out    # alpha=0 -> FFT无作用
+
+# 新 (V5, 不可旁路):
+x = x + 0.3 * freq_delta        # 0.3 固定, encoder必须适应
 ```
 
-权重极小（1e-4），仅在模型试图 collapse 到单一频段且无充分数据支撑时才起作用。不影响主 loss 的收敛路径。
+**等效性论证**: K = W_k(x + 0.3*freq_delta) = W_k(x) + 0.3*W_k(freq_delta)。QK^T = Q(W_k x)^T + 0.3*Q(W_k freq_delta)^T。第二项即为 attention logit 空间中的加性 bias，来源于频率内容。这避免了修改 cuboid attention 内部代码的复杂性，同时实现了等效的 attention logit bias 注入。
 
-### 7. α 初始化为 0
+**为什么 beta 不学习**: 防止 encoder 学成 W_k 抑制 freq_delta 项（即 K 中的 freq 分量被 W_k 拉向零），绕过 FFT。固定 beta 保证 freq_delta 始终有非零贡献。
 
+### 2. Soft band-pass（替代 hard high-pass）
+
+```python
+# 可学习频率选择函数: 低频可被"拉回"
+freq_weight[r] = sigmoid(MLP(r_norm))
+
+# 初始化:
+#   DC (r=0):  sigmoid(-1.4) ~ 0.2  -> 低频初权重低
+#   Nyq (r=1): sigmoid(0.85)  ~ 0.7  -> 高频初权重高
+# 但 MLP 训练后可调整: 中频涡旋信号可以被拉高
 ```
-训练 epoch 0：output = x + 0 × freq_out = x  → 等价于无分支
-训练结束：α 自动学到最优值
+
+**与 hard high-pass 对比**: hard split 无法适应不同 SST 状态（ENSO 期低频增强、涡旋季中频增强）。soft MLP 允许数据驱动调整。
+
+### 3. Influence 与 band_w 解耦
+
+```python
+band_w   = softmax(state_mlp(context))         # "选哪个频段"
+influence = sigmoid(influence_mlp(context))     # "调多少强度"
+band_w   = band_w * (0.5 + influence)           # [0.25, 1.25]
 ```
 
-确保频率分支不干扰 Earthformer 的原始训练轨迹，且可以安全插入已有 checkpoint 做 fine-tune。
+**为什么解耦**: 同一个频段在不同样本中可能需要不同强度。例如 El Nino 期 band_0（低频）被选中，但强度应比 La Nina 期更大。解耦后 band_w 的 softmax 负责选择, influence 独立负责强度。
+
+### 4. Auxiliary prediction head（直接梯度路径）
+
+FFT branch 有独立的 aux_head 直接预测下采样后的 SST，计算 aux_loss。这为 freq_delta 提供了一个不经过 encoder/decoder 的梯度路径，确保 FFT 必须学到 predictive signal。
+
+### 5. Smoothness loss（替代 entropy / diversity loss）
+
+```python
+loss_smooth = mean((amp相邻行差)^2 + (amp相邻列差)^2) * 0.01
+```
+
+- 只惩罚频谱中的孤立尖峰，不强制均匀分布
+- SST 低频天然占主导，不违背物理
+- 权重 0.01 极小，仅在最极端的孤峰情况下生效
+
+### 6. 无 detach，全梯度
+
+```python
+freq_delta = FFT(x)     # x有梯度, 非 x.detach()
+```
+
+Encoder 可以通过梯度反馈帮助 FFT 学习更有用的频率特征。两者协作而非竞争。
 
 ## 参数量
 
 | 组件 | 参数 |
 |------|------|
-| Per-group Linear(16→8), 4 groups | 544 |
-| Linear(32→K), K=4 | 132 |
-| freq_profiles: K×H×W_f | 5,084 |
-| channel_gates: K×D | 256 |
-| α | 1 |
-| **合计** | **~6,017** |
+| freq_weight_fn: Linear(1->16->1) | 1*16+16+16*1+1 = 49 |
+| group_pools: 4x Linear(16->4) | 4*(16*4+4) = 272 |
+| state_mlp: Linear(16->4) | 68 |
+| influence_mlp: Linear(16->4) | 68 |
+| freq_profiles: K x 1 x 1 | 4 |
+| channel_gates: K x D | 4*64 = 256 |
+| aux_head: 3x Conv3d | ~20K |
+| **合计** | **~28,000** |
 
-相对于 Earthformer 总参数 ~10M，增加 **0.06%**。
+相对于 Earthformer 总参数 ~10M，增加 **0.28%**。
+
+## 损失函数
+
+```python
+total_loss = main_loss + 0.2 * aux_loss + 0.01 * smoothness_loss
+
+main_loss:      pred vs target, masked MSE, per-pixel-per-day
+aux_loss:       aux_pred vs target_downsampled, MSE
+smoothness:     anti spectral spike
+```
+
+| 项 | 权重 | 作用 |
+|----|------|------|
+| main_loss | 1.0 | 主预测任务 |
+| aux_loss | 0.2 | 强制 freq_delta 学到 predictive signal |
+| smoothness | 0.01 | 防频谱孤峰，不强制均匀分布 |
 
 ## 论文可解释性
 
-### 可视化-1：可学习的频段 profiles
+### 可视化-1: 可学习频率选择曲线
 
 ```python
-# 训练结束后可视化 4 个频段的空间签名
-for k in range(K):
-    imshow(freq_profiles[k])   # (H, W_f) → 该频段偏好的频率区域
+r = linspace(0, 1, 100)
+freq_w = sigmoid(freq_weight_fn(r))
+plot(r, freq_w)  # 训练前后对比
 ```
 
-预期结果：4 个 profile 自然收敛到从低频到高频的渐近分布，但边界是数据驱动的，非人为指定。
+预期: 训练后中频 (0.3-0.6) 权重上升，对应涡旋尺度被增强。
 
-### 可视化-2：State-conditioned band activation
+### 可视化-2: State-conditioned band activation
 
 ```python
-# 对一组样本提取 band_w 并着色
-band_w[b, :]  # 4 维 softmax 向量
+# ENSO 期样本 vs 正常期样本
+band_w_enso.mean(dim=0) vs band_w_normal.mean(dim=0)
 ```
 
-预期结果：
-- ENSO 正位相样本 → band_0 权重最高
-- 涡旋区样本 → band_1/2 权重最高
-- 风暴样本 → band_3 权重最高
-
-### 可视化-3：Channel gate 的物理语义
+### 可视化-3: freq_delta 的 attention 影响
 
 ```python
-# 打印 σ(gate[k, :]) 的 64 维向量
-# 按通道分组后查看到底哪些通道被该频段增强/抑制
+# 对比有/无 freq_delta 时的 attention map
+attn_base = softmax(Q @ K_base.T / sqrt(d))
+attn_freq = softmax(Q @ K_freq.T / sqrt(d))
+diff = (attn_freq - attn_base).abs().mean()
+# 预期: 涡旋区 token 的 attention 分布被改变
 ```
 
 ### 论文段落模板
 
-> *The frequency branch adapts its spectral modulation to the large-scale ocean state via a lightweight state conditioner. The 64-dimensional feature map is split into four channel groups, each pooled globally to capture basin-averaged statistics. A two-layer MLP maps the concatenated context vector to K frequency-band activation weights, enabling sample-specific enhancement or suppression of spectral components. A learnable spatial profile and per-channel gate for each band are combined with the state-conditioned weights via a softmax-normalized spectral attention, ensuring bounded and numerically stable modulation. An entropy regularization term (weight 1e-4) prevents pathological single-band collapse.*
-
-## 代码
-
-### 模块定义
-
-```python
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-
-
-class SpatialFrequencyBranch(nn.Module):
-    """State-conditioned adaptive spatial frequency gating for Earthformer.
-
-    Insert between InitialEncoder and enc_pos_embed.
-    """
-
-    def __init__(self, dim: int = 64, num_bands: int = 4,
-                 num_groups: int = 4, state_hidden: int = 16):
-        super().__init__()
-
-        assert dim % num_groups == 0
-        group_dim = dim // num_groups
-
-        # State conditioner: per-group pool → shared context MLP
-        self.group_pools = nn.ModuleList([
-            nn.Linear(group_dim, state_hidden // num_groups)
-            for _ in range(num_groups)
-        ])
-        self.state_mlp = nn.Linear(state_hidden, num_bands)
-
-        # Learnable frequency profiles & channel gates
-        self.freq_profiles = nn.Parameter(torch.zeros(num_bands, 1, 1))
-        self.channel_gates = nn.Parameter(torch.full((num_bands, dim), -2.0))
-
-        # Global mixing scalar
-        self.alpha = nn.Parameter(torch.zeros(1))
-
-        self.dim = dim
-        self.num_bands = num_bands
-        self.num_groups = num_groups
-        self._profiles_expanded = None
-
-    def _ensure_profile(self, H: int, W_f: int, device: torch.device):
-        if (self._profiles_expanded is not None
-                and self._profiles_expanded.shape[-2:] == (H, W_f)):
-            return self._profiles_expanded.to(device=device)
-
-        p = self.freq_profiles                                     # (K, 1, 1)
-        # Bilinear interpolate to target freq grid
-        p = F.interpolate(p.unsqueeze(0), size=(H, W_f),
-                          mode='bilinear', align_corners=False)    # (1, K, H, W_f)
-        self._profiles_expanded = p.squeeze(0)                     # (K, H, W_f)
-        return self._profiles_expanded
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, T, H, W, D = x.shape
-        W_f = W // 2 + 1
-
-        # ── 2D spatial rFFT ──
-        X_f = torch.fft.rfft2(x.float(), dim=(-3, -2))            # (B,T,H,W_f,D) complex
-        amp = torch.abs(X_f)                                       # (B,T,H,W_f,D)
-        phase = torch.angle(X_f)
-
-        # ── State conditioner ──
-        groups = x.chunk(self.num_groups, dim=-1)                  # each (B,T,H,W,D//G)
-        z_parts = []
-        for g, pool in zip(groups, self.group_pools):
-            z = g.mean(dim=(1, 2, 3))                              # (B, D//G)
-            z_parts.append(pool(z))                                # (B, H_hidden//G)
-        context = torch.cat(z_parts, dim=-1)                       # (B, H_hidden)
-        band_w = F.softmax(self.state_mlp(context), dim=-1)        # (B, K)
-
-        # ── Spectral gating ──
-        profiles = self._ensure_profile(H, W_f, x.device)          # (K, H, W_f)
-        gates = torch.sigmoid(self.channel_gates)                  # (K, D)
-
-        # logits[b,k,h,w,d] → softmax over k
-        logits = (band_w[:, :, None, None, None]                   # (B, K, 1, 1, 1)
-                  * profiles[None, :, :, :, None]                  # (1, K, H, W_f, 1)
-                  * gates[None, :, None, None, :])                 # (1, K, 1, 1, D)
-        attn = F.softmax(logits, dim=1)                            # (B, K, H, W_f, D)
-        weight = (attn * profiles[None, :, :, :, None]).sum(dim=1) # (B, H, W_f, D)
-
-        amp_enhanced = amp * weight                                # (B, T, H, W_f, D)
-
-        # ── Reconstruct ──
-        X_enhanced = amp_enhanced * torch.exp(1j * phase)
-        freq_out = torch.fft.irfft2(X_enhanced, s=(H, W), dim=(-3, -2))
-        freq_out = freq_out.to(x.dtype)
-
-        return x + self.alpha * freq_out
-
-    def entropy_loss(self, x: torch.Tensor) -> torch.Tensor:
-        """Optional entropy regularization (call externally, weight ~1e-4)."""
-        groups = x.chunk(self.num_groups, dim=-1)
-        z_parts = []
-        for g, pool in zip(groups, self.group_pools):
-            z = g.mean(dim=(1, 2, 3))
-            z_parts.append(pool(z))
-        context = torch.cat(z_parts, dim=-1)
-        band_w = F.softmax(self.state_mlp(context), dim=-1)
-        log_bw = torch.log(band_w + 1e-8)
-        entropy = -(band_w * log_bw).sum(dim=-1).mean()
-        K = self.num_bands
-        return torch.log(torch.tensor(K, dtype=entropy.dtype,
-                                      device=entropy.device)) - entropy
-```
-
-### 插入到 CuboidTransformerModel
-
-在 `__init__` 中添加（`initial_encoder` 之后）：
-
-```python
-self.initial_encoder = InitialEncoder(...)
-self.freq_branch = SpatialFrequencyBranch(dim=base_units)   # ← 新增
-self.enc_pos_embed = PosEmbed(...)
-```
-
-在 `forward` 中：
-
-```python
-x = self.initial_encoder(x)
-x = self.freq_branch(x)                                     # ← 新增
-x = self.enc_pos_embed(x)
-mem_l = self.encoder(x)
-```
-
-### 在主训练 loss 中加 entropy 正则
-
-```python
-# 在 training_step 中：
-mse_loss = ((pred - Y) ** 2 * mask_t).sum() / (mask.sum() * B * T)
-entropy_reg = self.torch_nn_module.freq_branch.entropy_loss(x)
-total_loss = mse_loss + 1e-4 * entropy_reg
-```
+> *The Forced Spectral Learning Branch injects frequency-domain information directly into the encoder's QKV computation via feature-level modulation with a fixed mixing weight (beta=0.3). A soft band-pass mechanism, parameterized as a small MLP over normalized frequency radius, learns to emphasize mid-to-high spatial frequencies where attention-based feature smoothing loses detail. The band selection (softmax over K learnable frequency bands) and modulation strength (sigmoid-gated influence) are decoupled, allowing the model to independently choose which spectral band to activate and how strongly to modulate it per sample. An auxiliary prediction head provides a direct gradient path for the frequency residual, ensuring it carries predictive signal independent of the main encoder-decoder pathway. A spectral smoothness regularizer penalizes isolated frequency spikes without enforcing uniform spectral energy, respecting the natural low-frequency dominance in SST dynamics.*
 
 ## 消融实验建议
 
 | 实验 | 配置 | 验证目标 |
 |------|------|---------|
 | Baseline | 无频率分支 | 基准 |
-| +Freq Branch (full) | 本模块完整版 | 整体收益 |
-| − State conditioner | radius-based band assignment | 验证 state-conditioned 的价值 |
-| − Channel split | 单一 GlobalAvgPool | 验证分组池化的价值 |
-| − Softmax norm | `weight = 1 + Σ(logits)` | 验证 softmax 归一化的稳定性 |
-| 仅前 50 轮比较 | Loss 曲线 | 验证 `α=0` init 是否加速收敛 |
+| +FSL (full) | 完整版 | 整体收益 |
+| - aux_loss | lambda_aux = 0 | 验证直接梯度路径的必要性 |
+| - soft band-pass | hard freq_weight = [0,1] | 验证可学习频率选择 |
+| - influence | band_w = softmax only | 验证 influence 解耦的价值 |
+| beta 敏感度 | beta in [0.1, 0.5, 0.7] | 验证注入强度 |
 
 ## 限制与未来工作
 
-1. **时间维度**：当前仅做 2D 空间 FFT。若输入窗口扩展至 28 天，3D FFT 值得重新评估。
-2. **频段数量 K**：当前固定为 4。K 可作为超参搜索，或使用 nonparametric Bayesian 方法自动确定。
-3. **跨尺度相互作用**：当前各频段独立 gating，跨尺度能量级联（turbulence cascade）未被显式建模。可增加 band-interaction MLP。
-4. **训练初期**：`α=0` 保证安全，但 entropy regularization 需在 warmup 阶段之后才生效，避免早期 band 分布不稳定。
+1. **时间维度**: 当前仅 2D 空间 FFT。输入扩展至 28 天时重新评估 3D FFT。
+2. **K/V 分离调制**: 当前 QKV 共享特征增强。可对 K 和 V 分别用不同的 freq 投影。
+3. **跨尺度耦合**: 当前各频段独立 gating。可建模 frequency cross-talk（如涡旋-平均流的能量交换）。

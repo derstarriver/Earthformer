@@ -1,7 +1,7 @@
 # Earthformer 西北太平洋 SSTA 预测 — 工作流程详解
 
 > 基于 `scripts/cuboid_transformer/nwp_sst/train_nwp_sst.py` 和 `cfg_nwp.yaml` 配置
-> 最后更新: 预测7天, 4通道输入, scale_alpha=0.5
+> 最后更新: 预测7天, 4通道输入, scale_alpha=0.5, 含频率分支 (SpatialFrequencyBranch)
 
 ---
 
@@ -11,19 +11,20 @@
 2. [数据管线](#2-数据管线)
 3. [模型架构总览](#3-模型架构总览)
 4. [初始卷积编码 (InitialEncoder)](#4-初始卷积编码)
-5. [位置编码 (PosEmbed)](#5-位置编码)
-6. [编码器 — 3层层次结构](#6-编码器)
-7. [Cuboid Attention 逐层策略](#7-cuboid-attention)
-8. [全局向量 (Global Vectors)](#8-全局向量)
-9. [解码器](#9-解码器)
-10. [最终上采样 + 投影](#10-最终上采样)
-11. [损失函数](#11-损失函数)
-12. [评估指标](#12-评估指标)
-13. [优化器与学习率调度](#13-优化器与学习率调度)
-14. [完整数据形状流转表](#14-数据形状流转表)
-15. [配置说明](#15-配置说明)
-16. [训练流程](#16-训练流程)
-17. [Persistence Baseline](#17-persistence-baseline)
+5. [空间频率分支 (SpatialFrequencyBranch)](#5-空间频率分支)
+6. [位置编码 (PosEmbed)](#6-位置编码)
+7. [编码器 — 3层层次结构](#7-编码器)
+8. [Cuboid Attention 逐层策略](#8-cuboid-attention)
+9. [全局向量 (Global Vectors)](#9-全局向量)
+10. [解码器](#10-解码器)
+11. [最终上采样 + 投影](#11-最终上采样)
+12. [损失函数](#12-损失函数)
+13. [评估指标](#13-评估指标)
+14. [优化器与学习率调度](#14-优化器与学习率调度)
+15. [完整数据形状流转表](#15-数据形状流转表)
+16. [配置说明](#16-配置说明)
+17. [训练流程](#17-训练流程)
+18. [Persistence Baseline](#18-persistence-baseline)
 
 ---
 
@@ -127,6 +128,12 @@ ERA5 (SST/Wind) + CMEMS AVISO (SLA)，经过以下预处理步骤（各脚本独
 ┌──────────────────────────────────────┐
 │ InitialEncoder                       │
 │  Conv2D×3 → PatchMerging3D(1,2,2)    │  H:161→81, W:241→121, C:4→64
+└──────────────────────────────────────┘
+   │ (B, 14, 81, 121, 64)
+   ▼
+┌──────────────────────────────────────┐
+│ SpatialFrequencyBranch               │  FFT → amp gating → IFFT
+│  State-conditioned频段Gating          │  6K params, alpha init=0
 └──────────────────────────────────────┘
    │ (B, 14, 81, 121, 64)
    ▼
@@ -250,7 +257,141 @@ Step 4: PatchMerging3D(1,2,2)
 
 ---
 
-## 5. 位置编码 (PosEmbed)
+## 5. 空间频率分支 (SpatialFrequencyBranch)
+
+**源码**: `src/earthformer/cuboid_transformer/spatial_frequency_branch.py`
+
+**插入位置**: `InitialEncoder` 之后、`enc_pos_embed` 之前
+
+```python
+# cuboid_transformer.py forward()
+x = self.initial_encoder(x)       # (B, T, H, W, D)
+x = self.freq_branch(x)           # <-- 频率增强
+x = self.enc_pos_embed(x)
+```
+
+### 5.1 设计动机
+
+西北太平洋 SSTA 预测涉及多种具有清晰频域物理签名的海洋现象:
+- **低频**: ENSO 遥相关、季节循环、黑潮大弯曲
+- **中频**: 中尺度涡旋、锋面、Rossby 波
+- **高频**: 小尺度混合、观测噪声
+
+Cuboid Transformer 通过注意力隐式学习这些模式，但缺乏显式的频域结构表示。本模块提供 **~6K 参数（<0.06%）** 的轻量频域增强。
+
+### 5.2 架构
+
+```
+x: (B, T, H, W, D)
+  │
+  ├─────────────────────────────────┐
+  │                                 │
+  ▼                                 │
+rFFT2(H, W)                         │  2D空间实FFT
+  │                                 │
+  ▼                                 │
+X_f: (B, T, H, W_f, D) complex      │
+  ├── amp  = |X_f|                  │  振幅（参与学习）
+  └── phase = ∠X_f                  │  相位（保留不变）
+  │                                 │
+  ▼                                 │
+┌─ State Conditioner ────────────┐  │
+│ x → chunk(4组, dim=-1)         │  │  4组×16通道分别池化
+│   → per-group GlobalAvgPool    │  │  捕获流域级物理状态
+│   → Linear(16→4) × 4           │  │
+│   → concat → Linear(16→K)      │  │
+│   → softmax → band_w: (B, K)   │  │  每样本动态频段分配
+└────────────────────────────────┘  │
+  │                                 │
+  ▼                                 │
+┌─ Spectral Gating ──────────────┐  │
+│ profile[k,h,w]: (K,H,W_f)      │  │  可学习频段空间签名
+│ gate[k,d]:      (K,D)          │  │  每频段每通道门控
+│                                 │  │
+│ logits[b,k,h,w,d] =            │  │
+│   band_w[b,k]                  │  │
+│   × profile[k,h,w]             │  │
+│   × σ(gate[k,d])               │  │
+│                                 │  │
+│ attn = softmax_k(logits)        │  │  频段间归一化
+│ weight[b,h,w,d] =              │  │
+│   Σ_k attn × profile[k,h,w]    │  │  有界增强权重
+└────────────────────────────────┘  │
+  │                                 │
+  ▼                                 │
+amp' = amp × weight                 │  频域直接gating
+  │                                 │
+  ▼                                 │
+X' = amp' × exp(i × phase)          │  原相位重建
+  │                                 │
+  ▼                                 │
+irfft2(X', s=(H,W))                 │  回到空域
+  │                                 │
+  ▼                                 │
+  × α (learnable, init=0)           │  可学习缩放
+  │                                 │
+  └─────────────────────────────────┘
+  │
+  ▼
+output = x + α × freq_out           (B, T, H, W, D)
+```
+
+### 5.3 核心设计决策
+
+| 决策 | 选择 | 原因 |
+|------|------|------|
+| FFT维度 | 仅2D空间 (H,W) | 14天时间窗口太短, 时间FFT频率分辨率极低 |
+| 处理对象 | 仅振幅, 不碰相位 | 相位训练初期极易不稳定 |
+| 频率分配 | State-conditioned | ENSO/涡旋/正常态需要不同的频段增强 |
+| 通道分组 | 4组独立池化 | SSTA/U10/V10/SLA 频谱结构不同, 不应混合 |
+| 归一化 | softmax频段间 | 有界稳定, 天然频率守恒 |
+| 初始化 | α=0, gates=-2.0 | 训练初期等价于无分支, 安全插入已有checkpoint |
+| 正则化 | Entropy loss (1e-4) | 防single-band collapse |
+
+### 5.4 代码结构
+
+```python
+class SpatialFrequencyBranch(nn.Module):
+    def __init__(self, dim=64, num_bands=4, num_groups=4, state_hidden=16):
+        self.group_pools   # 4×Linear(16→4) per-group池化
+        self.state_mlp     # Linear(16→4) band权重
+        self.freq_profiles # (4, 1, 1) → bilinear插值到(H,W_f)
+        self.channel_gates # (4, 64) 每频段每通道门控
+        self.alpha         # scalar, init=0
+
+    def forward(self, x):
+        # rFFT2 → |amp|, phase
+        # State conditioner → band_w (B, 4)
+        # Spectral gating → softmax → weight
+        # amp × weight → irfft2 → alpha * residual
+        return x + self.alpha * freq_out
+
+    def entropy_loss(self, x):
+        # 正则化: log(K) - H(band_w)
+```
+
+### 5.5 训练时的 Entropy 正则化
+
+在 `training_step` 中:
+
+```python
+loss = mse_loss
+entropy_reg = self.torch_nn_module.freq_branch.entropy_loss(
+    self.torch_nn_module._freq_input)
+loss = loss + 1e-4 * entropy_reg
+```
+
+记录在 `metrics.csv` 中可监控频段分布是否 collapse。
+
+### 5.6 论文可解释性
+
+1. **可视化 freq_profiles**: 训练后 4 个 profile 自然收敛到低→高频的渐近分布, 边界由数据决定
+2. **band_w 分析**: ENSO 位相样本 vs 正常年样本的 band 激活模式对比
+3. **Channel gate**: 打印 σ(gate[k,:]) 查看各频段偏好哪些通道
+
+---
+
+## 6. 位置编码 (PosEmbed)
 
 **配置**: `pos_embed_type: "t+h+w"`
 
@@ -271,7 +412,7 @@ encoder 中只加一次，decoder 中每层上采样后可选重新加（`dec_hi
 
 ---
 
-## 6. 编码器 — 3层层次结构
+## 7. 编码器 — 3层层次结构
 
 **源码**: `CuboidTransformerEncoder`, `cuboid_transformer.py`
 
@@ -311,7 +452,7 @@ mem[2]: (B, 14, 21, 31, 128)   ← 低分辨率, 深语义, 解码器深层使�
 
 ---
 
-## 7. Cuboid Attention — 逐层策略
+## 8. Cuboid Attention — 逐层策略
 
 **当前配置**:
 ```yaml
@@ -364,7 +505,7 @@ strategy = ('l','l','l') → 全局部
 
 ---
 
-## 8. 全局向量 (Global Vectors)
+## 9. 全局向量 (Global Vectors)
 
 **配置**:
 ```yaml
@@ -381,7 +522,7 @@ global_dim_ratio: 1                # 全局向量维度 = 基础通道数
 
 ---
 
-## 9. 解码器
+## 10. 解码器
 
 **源码**: `CuboidTransformerDecoder`, `cuboid_transformer.py`
 
@@ -430,7 +571,7 @@ Block 0 (i=0, 最浅层, T=7, dim=64):
 
 ---
 
-## 10. 最终上采样 + 投影
+## 11. 最终上采样 + 投影
 
 **配置**:
 ```yaml
@@ -457,7 +598,7 @@ Step 3: 最终投影
 
 ---
 
-## 11. 损失函数
+## 12. 损失函数
 
 ```python
 def training_step(self, batch, batch_idx):
@@ -469,6 +610,12 @@ def training_step(self, batch, batch_idx):
     loss = ((pred - Y) ** 2 * mask_t).sum() / (mask.sum() * B * T)
     #                                          ^^^^^^^^^^^^^^^^^^^
     #                                          /ocean_pixels /B /T
+
+    # Entropy正则化 — 防频率分支band collapse
+    entropy_reg = self.torch_nn_module.freq_branch.entropy_loss(
+        self.torch_nn_module._freq_input)
+    loss = loss + 1e-4 * entropy_reg
+    self.log('entropy_reg', entropy_reg, on_step=False, on_epoch=True)
 ```
 
 **逐步解析**:
@@ -482,11 +629,13 @@ def training_step(self, batch, batch_idx):
 
 **重要**: 分母含 `B`（于 2026-06 修复），确保 loss 值是 per-sample-per-day-per-pixel 的 MSE，train/val 值的量级不受 batch_size 影响。
 
+**Entropy 正则化**: `loss_entropy = log(K) - H(band_w)`, 权重 1e-4。当 band_w 接近均匀分布时值为 0，collapse 到单一频段时趋近 log(K)。记录在 CSV 的 `entropy_reg` 列中监控。这是全局批次级统计量（`on_step=False`），数值稳定。
+
 ---
 
-## 12. 评估指标
+## 13. 评估指标
 
-### 12.1 训练/验证时 (归一化空间)
+### 13.1 训练/验证时 (归一化空间)
 
 ```python
 self.valid_mse(pred_ocean, Y_ocean)  # torchmetrics.MeanSquaredError
@@ -495,7 +644,7 @@ self.valid_mae(pred_ocean, Y_ocean)  # torchmetrics.MeanAbsoluteError
 
 torchmetrics 对所有像素（含陆地=0）求均值。`valid_mse_epoch` 用于 checkpoint 选择。
 
-### 12.2 测试时 (分天指标, 转换°C)
+### 13.2 测试时 (分天指标, 转换°C)
 
 ```python
 # 累计每天的平方误差和绝对误差
@@ -524,7 +673,7 @@ mae_degC = mae_per_day × ssta_std
 
 ---
 
-## 13. 优化器与学习率调度
+## 14. 优化器与学习率调度
 
 ### 13.1 AdamW
 
@@ -562,7 +711,7 @@ early_stop_patience: 10
 
 ---
 
-## 14. 完整数据形状流转表
+## 15. 完整数据形状流转表
 
 > 以下基于 `scale_alpha: 0.5`, `initial_downsample_scale: [1,2,2]`。
 > 括号中的值是 `scale_alpha=1.0` / `[1,4,4]` 时的对照。
@@ -585,6 +734,7 @@ early_stop_patience: 10
 | 模型输入 X | (B, 14, 161, 241, 4) | 批次化 |
 | 模型输出 Y_true | (B, 7, 161, 241, 1) | 仅SSTA |
 | InitialEncoder后 | (B, 14, 81, 121, 64) | 2×2下采样 |
+| FreqBranch后 | (B, 14, 81, 121, 64) | 频率增强, 形状不变 |
 | Enc Block 0 后 | (B, 14, 81, 121, 64) | mem[0] |
 | PatchMerge 后 | (B, 14, 41, 61, ~90) | 2×2下采样 |
 | Enc Block 1 后 | (B, 14, 41, 61, ~90) | mem[1] |
@@ -602,7 +752,7 @@ early_stop_patience: 10
 
 ---
 
-## 15. 配置说明
+## 16. 配置说明
 
 **文件**: `scripts/cuboid_transformer/nwp_sst/cfg_nwp.yaml`
 
@@ -639,7 +789,7 @@ early_stop_patience: 10
 
 ---
 
-## 16. 训练流程
+## 17. 训练流程
 
 ### 16.1 实验目录结构
 
@@ -690,7 +840,7 @@ python scripts/cuboid_transformer/nwp_sst/visualize_logs.py \
 
 ---
 
-## 17. Persistence Baseline
+## 18. Persistence Baseline
 
 **脚本**: `scripts/cuboid_transformer/nwp_sst/persistence_baseline.py`
 
@@ -710,6 +860,7 @@ pred = last_ssta.expand(-1, T_out, -1, -1, -1)
 |------|------|
 | `src/earthformer/cuboid_transformer/cuboid_transformer.py` | 完整模型: CuboidAttention, Encoder, Decoder, CuboidTransformerModel |
 | `src/earthformer/cuboid_transformer/cuboid_transformer_patterns.py` | 注意力模式注册表 (axial, spatial_lg, divided_st 等) |
+| `src/earthformer/cuboid_transformer/spatial_frequency_branch.py` | 空间频率分支 (SpatialFrequencyBranch, ~6K参数) |
 | `src/earthformer/cuboid_transformer/utils.py` | RMSNorm, padding, 位置嵌入, 初始化 |
 | `src/earthformer/datasets/nw_pacific_dataset.py` | 数据加载与 Dataset 构建 (4通道, stride=3, 7天) |
 | `scripts/cuboid_transformer/nwp_sst/train_nwp_sst.py` | 训练入口 + NWPPredictionModule |

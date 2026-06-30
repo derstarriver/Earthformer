@@ -437,18 +437,27 @@ class NWPPredictionModule(pl.LightningModule):
 
     def training_step(self, batch, batch_idx):
         X, Y, mask = batch
-        pred = self(X, mask)
-        B, T = pred.shape[0], pred.shape[1]
+        delta_pred = self(X, mask)                                     # (B, Tout, H, W, 1)
+        B, T = delta_pred.shape[0], delta_pred.shape[1]
         mask_t = mask.reshape(B, 1, mask.shape[1], mask.shape[2], 1)
+
+        # Step 2: Delta prediction — model outputs delta, convert to absolute SST
+        X_last = X[:, -1:, :, :, 0:1]                                  # (B, 1, H, W, 1)
+        pred = X_last + delta_pred                                      # (B, Tout, H, W, 1)
+
         loss = ((pred - Y) ** 2 * mask_t).sum() / (mask.sum() * B * T)
         self.log('train_loss', loss, on_step=True, on_epoch=True)
         return loss
 
     def validation_step(self, batch, batch_idx, dataloader_idx=0):
         X, Y, mask = batch
-        pred = self(X, mask)
-        B, T = pred.shape[0], pred.shape[1]
+        delta_pred = self(X, mask)                                     # (B, Tout, H, W, 1)
+        B, T = delta_pred.shape[0], delta_pred.shape[1]
         mask_t = mask.reshape(B, 1, mask.shape[1], mask.shape[2], 1)
+
+        X_last = X[:, -1:, :, :, 0:1]                                  # (B, 1, H, W, 1)
+        pred = X_last + delta_pred                                      # (B, Tout, H, W, 1)
+
         loss = ((pred - Y) ** 2 * mask_t).sum() / (mask.sum() * B * T)
 
         # Metrics over ocean only
@@ -470,9 +479,13 @@ class NWPPredictionModule(pl.LightningModule):
 
     def test_step(self, batch, batch_idx, dataloader_idx=0):
         X, Y, mask = batch
-        pred = self(X, mask)
-        B, T = pred.shape[0], pred.shape[1]
+        delta_pred = self(X, mask)                                     # (B, Tout, H, W, 1)
+        B, T = delta_pred.shape[0], delta_pred.shape[1]
         mask_t = mask.reshape(B, 1, mask.shape[1], mask.shape[2], 1)
+
+        X_last = X[:, -1:, :, :, 0:1]                                  # (B, 1, H, W, 1)
+        pred = X_last + delta_pred                                      # (B, Tout, H, W, 1)
+
         # Accumulate per-day squared error & absolute error over ocean
         sq_err = ((pred - Y) ** 2 * mask_t).sum(dim=(0,2,3,4))  # (T,)
         abs_err = ((pred - Y).abs() * mask_t).sum(dim=(0,2,3,4))  # (T,)

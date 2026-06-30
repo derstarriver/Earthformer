@@ -7,8 +7,8 @@ CSV format (metrics.csv):
 Usage:
     # All plots (training curves + test bar + prediction sample)
     python scripts/cuboid_transformer/nwp_sst/visualize_logs.py \
-        --exp_dir /home/lab/zhangxm/gxy/Earthformer/scripts/cuboid_transformer/nwp_sst/experiments/nwp_exp1/ \
-        --ckpt_path /home/lab/zhangxm/gxy/Earthformer/scripts/cuboid_transformer/nwp_sst/experiments/nwp_exp1/checkpoints/model-epoch=063.ckpt \
+        --exp_dir /home/gmm/zjj/gxy/Earthformer1/scripts/cuboid_transformer/nwp_sst/experiments/nwp_7day \
+        --ckpt_path /home/gmm/zjj/gxy/Earthformer1/scripts/cuboid_transformer/nwp_sst/experiments/nwp_7day/checkpoints/model-epoch=033.ckpt \
         --data_dir datasets/SST-PREDICT/ \
         --save experiment_summary
 
