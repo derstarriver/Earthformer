@@ -8,8 +8,8 @@ Builds a lazy-loading PyTorch Dataset from preprocessed ERA5 + SLA data:
   - SLA  (SLA_cropped.nc): daily sea level anomaly
   - Ocean mask (mask.npy): 1=ocean, 0=land
 
-    Input:  14 days × 161×241 × 4 channels [ssta, u10, v10, sla]
-    Output:  3 days × 161×241 × 1 channel  [ssta]
+    Input:  14 days × 161×241 × 7 channels [ssta, u10, v10, sla, grad_x, grad_y, advection]
+    Output:  7 days × 161×241 × 1 channel  [ssta]
 
 Usage:
     from earthformer.datasets.nw_pacific_dataset import build_dataloaders
@@ -46,7 +46,7 @@ class NWPacificDataset(Dataset):
     demand without copying the full dataset.
     """
 
-    def __init__(self, data, mask, input_len=14, pred_len=3, stride=1):
+    def __init__(self, data, mask, input_len=14, pred_len=7, stride=1):
         """
         Parameters
         ----------
@@ -80,9 +80,9 @@ class NWPacificDataset(Dataset):
 
     def __getitem__(self, idx):
         start = idx * self.stride
-        seq = self.data[start:start + self.total_len]            # (17, 161, 241, C)
+        seq = self.data[start:start + self.total_len]            # (21, 161, 241, C)
         x = np.ascontiguousarray(seq[:self.input_len])           # (14, 161, 241, C)
-        y = np.ascontiguousarray(seq[self.input_len:, ..., 0:1]) # (3, 161, 241, 1) — ssta only
+        y = np.ascontiguousarray(seq[self.input_len:, ..., 0:1]) # (7, 161, 241, 1) — ssta only
 
         return (
             torch.from_numpy(x),
@@ -220,8 +220,36 @@ def build_data_array(data_dir, stats=None):
           f"u10∈[{u10.min():.2f},{u10.max():.2f}], v10∈[{v10.min():.2f},{v10.max():.2f}], "
           f"sla∈[{sla[sla!=0].min():.2f},{sla.max():.2f}]")
 
-    # ── Stack channels ──
-    data = np.stack([ssta, u10, v10, sla], axis=-1)  # (T, 161, 241, 4)
+    # ── Physics channels: ∇SST and wind-driven advection ──
+    print_step("Computing physics channels (grad_x, grad_y, advection) ...")
+    train_bool = (years >= TRAIN_YEARS[0]) & (years <= TRAIN_YEARS[1])
+    ocean_bool = mask.astype(bool)
+
+    # Spatial gradients of normalized SSTA (axis=2 → lon/E-W, axis=1 → lat/N-S)
+    grad_x    = np.gradient(ssta, axis=2).astype(np.float32)   # ∂SSTA/∂lon
+    grad_y    = np.gradient(ssta, axis=1).astype(np.float32)   # ∂SSTA/∂lat
+    # Wind-driven advection: -u·∇SST  (positive = warming tendency)
+    advection = (-(u10 * grad_x + v10 * grad_y)).astype(np.float32)
+
+    def _norm_phys(arr, name):
+        """Normalize a derived channel using training-ocean statistics."""
+        vals = arr[train_bool][:, ocean_bool]
+        mean = float(np.mean(vals))
+        std  = float(np.std(vals))
+        if std < 1e-8:
+            std = 1.0
+        normed = ((arr - mean) / std).astype(np.float32)
+        normed = np.where(mask, normed, 0.0).astype(np.float32)
+        print(f"    {name}: mean={mean:.4f}, std={std:.4f} "
+              f"→ range [{normed[ocean_bool].min():.2f}, {normed[ocean_bool].max():.2f}]")
+        return normed
+
+    grad_x    = _norm_phys(grad_x,    "grad_x")
+    grad_y    = _norm_phys(grad_y,    "grad_y")
+    advection = _norm_phys(advection, "advection")
+
+    # ── Stack 7 channels: [ssta, u10, v10, sla, grad_x, grad_y, advection] ──
+    data = np.stack([ssta, u10, v10, sla, grad_x, grad_y, advection], axis=-1)
     print(f"  Final data shape: {data.shape} ({data.nbytes/1e9:.2f} GB)")
 
     return data, mask, years
@@ -249,7 +277,7 @@ def build_dataloaders(data_dir=None, batch_size=2, num_workers=4, stats=None):
 
     print("=" * 60)
     print("  NW Pacific Dataset Builder")
-    print(f"  Input: {INPUT_LEN}d × 4 channels [ssta,u10,v10,sla]  →  Output: {PRED_LEN}d × 1 channel [ssta]")
+    print(f"  Input: {INPUT_LEN}d × 7 channels [ssta,u10,v10,sla,grad_x,grad_y,advection]  →  Output: {PRED_LEN}d × 1 channel [ssta]")
     print("=" * 60)
 
     # ── Load stats if already computed ──

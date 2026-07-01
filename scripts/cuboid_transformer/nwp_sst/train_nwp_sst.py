@@ -1,56 +1,25 @@
 #!/usr/bin/env python
 """Train Earthformer for NW Pacific daily SSTA prediction.
-1213132123132132
-Input:  14 days × 161×241 × 4 channels [ssta, u10, v10, sla]
+
+Input:  14 days × 161×241 × 7 channels [ssta, u10, v10, sla, grad_x, grad_y, advection]
 Output:  7 days × 161×241 × 1 channel  [ssta]
 
-Usage:
-    TRAIN
-
-    14-3
-    python scripts/cuboid_transformer/nwp_sst/train_nwp_sst.py \
-    --gpus 1 --save nwp_exp1 --data_dir datasets/SST-PREDICT/ \
-    --cfg scripts/cuboid_transformer/nwp_sst/cfg_nwp.yaml
-
-
-
-    14-7
-    python scripts/cuboid_transformer/nwp_sst/train_nwp_sst.py \
-    --gpus 1 --save nwp_7day --data_dir datasets/SST-PREDICT/ \
-    --cfg scripts/cuboid_transformer/nwp_sst/cfg_nwp.yaml
-
-13123
-
- # 断点续训
+# 训练
 python scripts/cuboid_transformer/nwp_sst/train_nwp_sst.py \
-    --gpus 1 --save nwp_exp1 --data_dir datasets/SST-PREDICT/ \
-    --cfg scripts/cuboid_transformer/nwp_sst/cfg_nwp.yaml \
-    --ckpt_name last.ckpt
-
-
-?
-        python scripts/cuboid_transformer/nwp_sst/train_nwp_sst.py \
     --gpus 1 --save nwp_7day --data_dir datasets/SST-PREDICT/ \
     --cfg scripts/cuboid_transformer/nwp_sst/cfg_nwp.yaml
-    --ckpt_name /home/gmm/zjj/gxy/Earthformer1/scripts/cuboid_transformer/nwp_sst/experiments/nwp_7day/checkpoints/last.ckpt
 
+# 断点续训
 python scripts/cuboid_transformer/nwp_sst/train_nwp_sst.py \
     --gpus 1 --save nwp_7day --data_dir datasets/SST-PREDICT/ \
     --cfg scripts/cuboid_transformer/nwp_sst/cfg_nwp.yaml \
     --ckpt_name last.ckpt
-
-
-# 测试
-python scripts/cuboid_transformer/nwp_sst/train_nwp_sst.py \
-    --gpus 1 --test --save nwp_exp1 --data_dir datasets/SST-PREDICT/ \
-    --ckpt_name /home/lab/zhangxm/gxy/Earthformer/scripts/cuboid_transformer/nwp_sst/experiments/nwp_exp1/checkpoints/model-epoch=051.ckpt \
-    --cfg scripts/cuboid_transformer/nwp_sst/cfg_nwp.yaml
 
 # 测试（选最优 epoch）
 python scripts/cuboid_transformer/nwp_sst/train_nwp_sst.py \
     --gpus 1 --test --save nwp_7day --data_dir datasets/SST-PREDICT/ \
     --cfg scripts/cuboid_transformer/nwp_sst/cfg_nwp.yaml \
-    --ckpt_name model-epoch=066.ckpt
+    --ckpt_name model-epoch=033.ckpt
 """
 import warnings
 import os
@@ -271,8 +240,8 @@ class NWPPredictionModule(pl.LightningModule):
     @staticmethod
     def _default_model():
         cfg = OmegaConf.create()
-        cfg.data_channels = 4
-        cfg.input_shape = (14, 161, 241, 4)
+        cfg.data_channels = 7
+        cfg.input_shape = (14, 161, 241, 7)
         cfg.target_shape = (7, 161, 241, 1)
         cfg.base_units = 64
         cfg.scale_alpha = 1.0
@@ -327,7 +296,7 @@ class NWPPredictionModule(pl.LightningModule):
         cfg = OmegaConf.create()
         cfg.data_dir = "datasets/SST-PREDICT/"
         cfg.in_len = 14
-        cfg.out_len = 3
+        cfg.out_len = 7
         return cfg
 
     # ── Optimizer ──
@@ -432,21 +401,65 @@ class NWPPredictionModule(pl.LightningModule):
 
     # ── Forward ──
     def forward(self, X, mask):
-        """X: (B, 14, 161, 241, 4) → pred: (B, 3, 161, 241, 1)"""
+        """X: (B, 14, 161, 241, 7) → delta_pred: (B, 7, 161, 241, 1)"""
         return self.torch_nn_module(X)
+
+    def _compute_loss(self, pred, Y, mask_t, X_last, B, T):
+        """Multi-physics loss: MSE + gradient preservation + temporal tendency + anti-persistence.
+
+        pred, Y : (B, T, H, W, 1) — normalized SSTA
+        mask_t  : (B, 1, H, W, 1) — ocean mask
+        X_last  : (B, 1, H, W, 1) — last input frame (persistence baseline)
+        """
+        m = mask_t.expand(-1, T, -1, -1, -1)   # (B, T, H, W, 1)
+        n_oce = m.sum()
+
+        # 1. Per-day weighted MSE — later days get slightly higher weight to fight persistence
+        day_w = torch.linspace(0.8, 1.2, T, device=pred.device).view(1, T, 1, 1, 1)
+        loss_mse       = ((pred - Y) ** 2 * m * day_w).sum() / n_oce
+        loss_mse_plain = ((pred - Y) ** 2 * m).sum() / n_oce
+
+        # 2. Spatial gradient MSE — preserves fronts and eddies
+        gx_p = pred[:, :, :, 1:] - pred[:, :, :, :-1]   # (B, T, H, W-1, 1)
+        gx_t = Y[:, :, :, 1:]    - Y[:, :, :, :-1]
+        gy_p = pred[:, :, 1:]    - pred[:, :, :-1]       # (B, T, H-1, W, 1)
+        gy_t = Y[:, :, 1:]       - Y[:, :, :-1]
+        # Mask: only between two ocean neighbors (avoids coast artifacts)
+        m_gx = mask_t[:, :, :, 1:] * mask_t[:, :, :, :-1]   # (B, 1, H, W-1, 1)
+        m_gy = mask_t[:, :, 1:]    * mask_t[:, :, :-1]       # (B, 1, H-1, W, 1)
+        loss_grad = 0.5 * (
+            ((gx_p - gx_t) ** 2 * m_gx).sum() / (m_gx.sum() * T + 1e-8) +
+            ((gy_p - gy_t) ** 2 * m_gy).sum() / (m_gy.sum() * T + 1e-8)
+        )
+
+        # 3. Temporal tendency MSE — forces model to learn day-to-day dynamics
+        dt_p = pred[:, 1:] - pred[:, :-1]   # (B, T-1, H, W, 1)
+        dt_t = Y[:, 1:]    - Y[:, :-1]
+        m_dt = mask_t.expand(-1, T - 1, -1, -1, -1)
+        loss_tend = ((dt_p - dt_t) ** 2 * m_dt).sum() / (m_dt.sum() + 1e-8)
+
+        # 4. Anti-persistence: soft penalty when model no better than naive X_last repeat
+        X_persist = X_last.expand(-1, T, -1, -1, -1)
+        persist_mse = ((X_persist - Y) ** 2 * m).sum() / n_oce
+        loss_anti = F.relu(loss_mse_plain - persist_mse * 0.95)
+
+        total = loss_mse + 0.3 * loss_grad + 0.5 * loss_tend + 0.2 * loss_anti
+        return total, {'mse': loss_mse_plain, 'grad': loss_grad,
+                       'tend': loss_tend, 'anti': loss_anti}
 
     def training_step(self, batch, batch_idx):
         X, Y, mask = batch
-        delta_pred = self(X, mask)                                     # (B, Tout, H, W, 1)
+        delta_pred = self(X, mask)                              # (B, T, H, W, 1)
         B, T = delta_pred.shape[0], delta_pred.shape[1]
         mask_t = mask.reshape(B, 1, mask.shape[1], mask.shape[2], 1)
 
-        # Step 2: Delta prediction — model outputs delta, convert to absolute SST
-        X_last = X[:, -1:, :, :, 0:1]                                  # (B, 1, H, W, 1)
-        pred = X_last + delta_pred                                      # (B, Tout, H, W, 1)
+        X_last = X[:, -1:, :, :, 0:1]                          # (B, 1, H, W, 1)
+        pred   = X_last + delta_pred                            # (B, T, H, W, 1)
 
-        loss = ((pred - Y) ** 2 * mask_t).sum() / (mask.sum() * B * T)
+        loss, components = self._compute_loss(pred, Y, mask_t, X_last, B, T)
         self.log('train_loss', loss, on_step=True, on_epoch=True)
+        for k, v in components.items():
+            self.log(f'train_{k}', v, on_step=False, on_epoch=True)
         return loss
 
     def validation_step(self, batch, batch_idx, dataloader_idx=0):

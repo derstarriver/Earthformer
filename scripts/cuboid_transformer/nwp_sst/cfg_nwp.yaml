@@ -1,17 +1,12 @@
 # Earthformer NW Pacific SSTA Prediction Config
-# Input:  (14, 161, 241, 4) = 14 days × 4 channels (ssta, u10, v10, sla)
+# Input:  (14, 161, 241, 7) = 14 days × 7 channels (ssta, u10, v10, sla, grad_x, grad_y, advection)
 # Output: (7, 161, 241, 1)  =  7 days × 1 channel  (ssta)
-#twset1313213213515
-
-
-#test fetch
-#=========================
 
 dataset:
   data_dir: "datasets/SST-PREDICT/"
   in_len: 14
   out_len: 7
-  var_names: ["ssta", "u10", "v10", "sla"]
+  var_names: ["ssta", "u10", "v10", "sla", "grad_x", "grad_y", "advection"]
 
 layout:
   in_len: 14
@@ -52,8 +47,8 @@ vis:
   eval_example_only: false
 
 model:
-  data_channels: 4
-  input_shape: [14, 161, 241, 4]
+  data_channels: 7
+  input_shape: [14, 161, 241, 7]
   target_shape: [7, 161, 241, 1]
   base_units: 64
   scale_alpha: 0.4

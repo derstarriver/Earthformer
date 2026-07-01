@@ -7,7 +7,7 @@ to answer: "What capability is the model missing — spatial, temporal, or physi
 Usage:
     python scripts/cuboid_transformer/nwp_sst/diagnose_model.py \
         --exp_dir experiments/nwp_7day/ \
-        --ckpt_name model-epoch=033.ckpt \
+        --ckpt_name /home/gmm/zjj/gxy/Earthformer1/scripts/cuboid_transformer/nwp_sst/experiments/nwp_7day/checkpoints/model-epoch=033.ckpt \
         --data_dir datasets/SST-PREDICT/ \
         --cfg scripts/cuboid_transformer/nwp_sst/cfg_nwp.yaml
 """
