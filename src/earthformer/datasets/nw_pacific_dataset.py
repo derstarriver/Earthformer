@@ -233,15 +233,20 @@ def build_data_array(data_dir, stats=None):
 
     def _norm_phys(arr, name):
         """Normalize a derived channel using training-ocean statistics."""
-        vals = arr[train_bool][:, ocean_bool]
+        # Flatten spatial dims → 1D boolean index (avoids numpy 2D boolean indexing issues)
+        T_train  = int(train_bool.sum())
+        flat     = arr[train_bool].reshape(T_train, -1)   # (T_train, H*W)
+        ocean_1d = ocean_bool.ravel()                      # (H*W,)
+        vals     = flat[:, ocean_1d]                       # (T_train, n_ocean)
         mean = float(np.mean(vals))
         std  = float(np.std(vals))
         if std < 1e-8:
             std = 1.0
-        normed = ((arr - mean) / std).astype(np.float32)
-        normed = np.where(mask, normed, 0.0).astype(np.float32)
+        normed = np.where(mask, (arr - mean) / std, 0.0).astype(np.float32)
+        # Check range on single timestep (2D boolean on 2D slice is safe)
+        sample = normed[0][ocean_bool]
         print(f"    {name}: mean={mean:.4f}, std={std:.4f} "
-              f"→ range [{normed[ocean_bool].min():.2f}, {normed[ocean_bool].max():.2f}]")
+              f"→ range [{sample.min():.2f}, {sample.max():.2f}]")
         return normed
 
     grad_x    = _norm_phys(grad_x,    "grad_x")
