@@ -7,7 +7,7 @@ to answer: "What capability is the model missing — spatial, temporal, or physi
 Usage:
     python scripts/cuboid_transformer/nwp_sst/diagnose_model.py \
         --exp_dir experiments/nwp_7day/ \
-        --ckpt_name model-epoch=XXX.ckpt \
+        --ckpt_name model-epoch=033.ckpt \
         --data_dir datasets/SST-PREDICT/ \
         --cfg scripts/cuboid_transformer/nwp_sst/cfg_nwp.yaml
 """
@@ -44,10 +44,29 @@ def _resolve_ckpt(ckpt_path, map_location="cpu"):
 
 
 def _build_model_from_cfg(cfg_path, device="cpu"):
-    """Build CuboidTransformerModel from a cfg YAML."""
+    """Build CuboidTransformerModel from a cfg YAML.
+
+    Uses the same config->model path as train_nwp_sst.py to guarantee consistency.
+    """
     from omegaconf import OmegaConf
     oc = OmegaConf.load(open(cfg_path, "r"))
     mc = oc.model
+
+    # Resolve attention patterns (consistent with train_nwp_sst.py)
+    num_blocks = len(mc.enc_depth)
+
+    def _resolve(key):
+        val = mc[key]
+        if isinstance(val, str):
+            return [val] * num_blocks
+        if isinstance(val, (list, tuple)):
+            return list(val)
+        return OmegaConf.to_container(val)
+
+    enc_attn_patterns = _resolve("self_pattern")
+    dec_self_attn_patterns = _resolve("cross_self_pattern")
+    dec_cross_attn_patterns = _resolve("cross_pattern")
+
     model = CuboidTransformerModel(
         input_shape=list(mc.input_shape),
         target_shape=list(mc.target_shape),
@@ -69,9 +88,9 @@ def _build_model_from_cfg(cfg_path, device="cpu"):
         use_global_self_attn=mc.get("use_global_self_attn", False),
         separate_global_qkv=mc.get("separate_global_qkv", False),
         global_dim_ratio=mc.get("global_dim_ratio", 1),
-        self_pattern=list(mc.self_pattern),
-        cross_self_pattern=list(mc.cross_self_pattern),
-        cross_pattern=list(mc.cross_pattern),
+        enc_attn_patterns=enc_attn_patterns,
+        dec_self_attn_patterns=dec_self_attn_patterns,
+        dec_cross_attn_patterns=dec_cross_attn_patterns,
         dec_cross_last_n_frames=mc.get("dec_cross_last_n_frames"),
         attn_drop=mc.get("attn_drop", 0.0),
         proj_drop=mc.get("proj_drop", 0.0),
