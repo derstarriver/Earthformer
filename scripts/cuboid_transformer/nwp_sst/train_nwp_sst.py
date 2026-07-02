@@ -19,7 +19,7 @@ python scripts/cuboid_transformer/nwp_sst/train_nwp_sst.py \
 python scripts/cuboid_transformer/nwp_sst/train_nwp_sst.py \
     --gpus 1 --test --save nwp_7day --data_dir datasets/SST-PREDICT/ \
     --cfg scripts/cuboid_transformer/nwp_sst/cfg_nwp.yaml \
-    --ckpt_name model-epoch=033.ckpt
+    --ckpt_name model-epoch=020.ckpt
 """
 import warnings
 import os
@@ -333,19 +333,35 @@ class NWPPredictionModule(pl.LightningModule):
         print(f"  Hparams saved: {hparams_path}")
 
     def on_fit_start(self):
-        """Save hyperparameters and CSV header once at training start."""
+        """Save hyperparameters and CSV header once at training start.
+
+        Preserves existing metrics.csv on resume — only writes header for a truly
+        fresh run (no file yet) to avoid overwriting previous training history.
+        """
         self._save_hparams()
 
         self._csv_path = os.path.join(self.save_dir, "metrics.csv")
-        header = "epoch,train_loss,valid_loss,valid_mse,valid_mae,learning_rate\n"
-        # Truncate on fresh run (epoch 0); append on resume
-        if self.trainer.current_epoch == 0:
+        self._csv_header = "epoch,train_loss,valid_loss,valid_mse,valid_mae,learning_rate\n"
+        if not os.path.exists(self._csv_path):
             with open(self._csv_path, 'w') as f:
-                f.write(header)
-        elif not os.path.exists(self._csv_path):
-            with open(self._csv_path, 'w') as f:
-                f.write(header)
-        print(f"  Metrics CSV: {self._csv_path}")
+                f.write(self._csv_header)
+            print(f"  Metrics CSV (new): {self._csv_path}")
+        else:
+            # Verify existing file has a header; repair if truncated
+            with open(self._csv_path, 'r') as f:
+                first = f.readline()
+            if not first.startswith('epoch,'):
+                # File exists but is corrupt / truncated → re-create header
+                full = ''
+                with open(self._csv_path, 'r') as f:
+                    full = f.read()
+                with open(self._csv_path, 'w') as f:
+                    f.write(self._csv_header)
+                    if full.strip():
+                        f.write(full)
+                print(f"  Metrics CSV (repaired): {self._csv_path}")
+            else:
+                print(f"  Metrics CSV (appending): {self._csv_path}")
 
     def on_train_epoch_end(self):
         """Append one row to metrics CSV after each training epoch."""

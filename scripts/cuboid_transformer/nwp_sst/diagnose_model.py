@@ -34,12 +34,12 @@ from earthformer.cuboid_transformer.cuboid_transformer import CuboidTransformerM
 # ---------------------------------------------------------------------------
 
 def _resolve_ckpt(ckpt_path, map_location="cpu"):
-    ckpt = torch.load(ckpt_path, map_location=map_location, weights_only=False)
+    ckpt = torch.load(ckpt_path, map_location=map_location,
+                      weights_only=False)  # noqa — PL ckpt requires full unpickle
     sd = ckpt["state_dict"] if "state_dict" in ckpt else ckpt
     # strip lightning prefix
     prefix = "torch_nn_module."
     sd = {k[len(prefix):] if k.startswith(prefix) else k: v for k, v in sd.items()}
-    # strip freq_branch keys if model doesn't have one (backward compat)
     return sd
 
 
@@ -409,20 +409,20 @@ def exp_autocorr(data, out_dir):
     T_out = pred.shape[1]
 
     def _acf(seq):
-        """seq: (N, T, H, W) -> per-pixel ACF averaged."""
-        N, T = seq.shape[:2]
-        acf_all = np.zeros((T - 1, seq.shape[2], seq.shape[3]))
+        """seq: (N, T, H, W) -> per-pixel ACF averaged, vectorized."""
+        N, T, H, W = seq.shape
+        acf_lags = []
         for lag in range(1, T):
-            a = seq[:, lag:, :, :].reshape(-1, seq.shape[2], seq.shape[3])
-            b = seq[:, :-lag, :, :].reshape(-1, seq.shape[2], seq.shape[3])
-            # per-pixel correlation over time
-            for hi in range(seq.shape[2]):
-                for wi in range(seq.shape[3]):
-                    if omask[hi, wi]:
-                        aa, bb = a[:, hi, wi], b[:, hi, wi]
-                        if aa.std() > 0 and bb.std() > 0:
-                            acf_all[lag-1, hi, wi] = np.corrcoef(aa, bb)[0, 1]
-        return np.array([np.nanmean(acf_all[lag, :, :][omask]) for lag in range(T_out - 1)])
+            a = seq[:, lag:, :, :].reshape(-1, H, W)   # (N*(T-lag), H, W)
+            b = seq[:, :-lag, :, :].reshape(-1, H, W)
+            a_dm = a - a.mean(axis=0, keepdims=True)
+            b_dm = b - b.mean(axis=0, keepdims=True)
+            num = (a_dm * b_dm).sum(axis=0)                                 # (H, W)
+            den = np.sqrt((a_dm**2).sum(axis=0) * (b_dm**2).sum(axis=0)) + 1e-8
+            corr_map = num / den
+            corr_map[~omask] = np.nan
+            acf_lags.append(np.nanmean(corr_map))
+        return np.array(acf_lags)
 
     acf_truth = _acf(truth)
     acf_pred = _acf(pred)
@@ -488,23 +488,21 @@ def exp_persistence_improve(data, stats, out_dir):
 # ===========================================================================
 
 def exp_temporal_corr(data, out_dir):
-    """Per-pixel Pearson corr between pred and truth time series."""
+    """Per-pixel Pearson corr between pred and truth time series, vectorized."""
     pred = data["pred"][:, :, :, :, 0]     # (N, T, H, W)
     truth = data["truth"][:, :, :, :, 0]
     omask = _ocean_mask(data)
-    T_out = pred.shape[1]
+    T_out, H, W = pred.shape[1], pred.shape[2], pred.shape[3]
 
-    H, W = pred.shape[2], pred.shape[3]
     corr_map = np.zeros((T_out, H, W))
-
     for d in range(T_out):
-        for hi in range(H):
-            for wi in range(W):
-                if omask[hi, wi]:
-                    p = pred[:, d, hi, wi]
-                    t = truth[:, d, hi, wi]
-                    if p.std() > 0 and t.std() > 0:
-                        corr_map[d, hi, wi] = np.corrcoef(p, t)[0, 1]
+        p = pred[:, d, :, :]   # (N, H, W)
+        t = truth[:, d, :, :]
+        p_dm = p - p.mean(axis=0, keepdims=True)
+        t_dm = t - t.mean(axis=0, keepdims=True)
+        num = (p_dm * t_dm).sum(axis=0)                                     # (H, W)
+        den = np.sqrt((p_dm**2).sum(axis=0) * (t_dm**2).sum(axis=0)) + 1e-8
+        corr_map[d] = num / den
 
     fig, axes = plt.subplots(2, 2, figsize=(14, 12))
     for idx, d in enumerate([0, 2, 4, 6]):
@@ -828,9 +826,11 @@ def main():
 
     # ── Load data ──
     print("Loading test data...")
-    _, _, test_loader, stats_raw = build_dataloaders(
+    _, _, test_loader, _stats_return = build_dataloaders(
         data_dir=args.data_dir, batch_size=2, num_workers=2)
-    stats = {k: float(stats_raw[k]) for k in stats_raw.files} if hasattr(stats_raw, 'files') else {}
+    # build_dataloaders returns a plain dict {chan: (mean, std), ...} which does
+    # NOT have 'ssta_std' keys. Load from npz directly for flat key access.
+    stats = _load_stats(args.data_dir)
 
     # ── Collect predictions ──
     print("Running inference...")
