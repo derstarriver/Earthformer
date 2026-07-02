@@ -8,7 +8,7 @@ Output:  7 days × 161×241 × 1 channel  [ssta]
 python scripts/cuboid_transformer/nwp_sst/train_nwp_sst.py \
     --gpus 1 --save nwp_7day --data_dir datasets/SST-PREDICT/ \
     --cfg scripts/cuboid_transformer/nwp_sst/cfg_nwp.yaml
-
+789456111111
 # 断点续训
 python scripts/cuboid_transformer/nwp_sst/train_nwp_sst.py \
     --gpus 1 --save nwp_7day --data_dir datasets/SST-PREDICT/ \
@@ -405,7 +405,7 @@ class NWPPredictionModule(pl.LightningModule):
         return self.torch_nn_module(X)
 
     def _compute_loss(self, pred, Y, mask_t, X_last, B, T):
-        """Multi-physics loss: MSE + gradient preservation + temporal tendency + anti-persistence.
+        """Multi-physics loss: MSE + gradient MSE + temporal tendency MSE + anti-persistence.
 
         pred, Y : (B, T, H, W, 1) — normalized SSTA
         mask_t  : (B, 1, H, W, 1) — ocean mask
@@ -414,38 +414,48 @@ class NWPPredictionModule(pl.LightningModule):
         m = mask_t.expand(-1, T, -1, -1, -1)   # (B, T, H, W, 1)
         n_oce = m.sum()
 
-        # 1. Per-day weighted MSE — later days get slightly higher weight to fight persistence
-        day_w = torch.linspace(0.8, 1.2, T, device=pred.device).view(1, T, 1, 1, 1)
+        # 1. Per-day weighted MSE — later days get higher weight to fight persistence
+        day_w = torch.linspace(0.8, 1.5, T, device=pred.device).view(1, T, 1, 1, 1)
         loss_mse       = ((pred - Y) ** 2 * m * day_w).sum() / n_oce
         loss_mse_plain = ((pred - Y) ** 2 * m).sum() / n_oce
 
-        # 2. Spatial gradient MSE — preserves fronts and eddies
-        gx_p = pred[:, :, :, 1:] - pred[:, :, :, :-1]   # (B, T, H, W-1, 1)
-        gx_t = Y[:, :, :, 1:]    - Y[:, :, :, :-1]
-        gy_p = pred[:, :, 1:]    - pred[:, :, :-1]       # (B, T, H-1, W, 1)
-        gy_t = Y[:, :, 1:]       - Y[:, :, :-1]
-        # Mask: only between two ocean neighbors (avoids coast artifacts)
-        m_gx = mask_t[:, :, :, 1:] * mask_t[:, :, :, :-1]   # (B, 1, H, W-1, 1)
-        m_gy = mask_t[:, :, 1:]    * mask_t[:, :, :-1]       # (B, 1, H-1, W, 1)
+        # 2. Spatial gradient MSE on DELTA only (not X_last + delta)
+        #    Reason: X_last dominates the absolute gradient, masking delta's contribution.
+        #    Computing on delta directly forces the model to output spatially structured changes.
+        delta = pred - X_last.expand(-1, T, -1, -1, -1)   # (B, T, H, W, 1) — pure delta
+        delta_t_ref = Y - X_last.expand(-1, T, -1, -1, -1)
+        gx_d = delta[:, :, :, 1:] - delta[:, :, :, :-1]         # (B, T, H, W-1, 1)
+        gx_r = delta_t_ref[:, :, :, 1:] - delta_t_ref[:, :, :, :-1]
+        gy_d = delta[:, :, 1:] - delta[:, :, :-1]               # (B, T, H-1, W, 1)
+        gy_r = delta_t_ref[:, :, 1:] - delta_t_ref[:, :, :-1]
+        m_gx = mask_t[:, :, :, 1:] * mask_t[:, :, :, :-1]       # (B, 1, H, W-1, 1)
+        m_gy = mask_t[:, :, 1:] * mask_t[:, :, :-1]             # (B, 1, H-1, W, 1)
         loss_grad = 0.5 * (
-            ((gx_p - gx_t) ** 2 * m_gx).sum() / (m_gx.sum() * T + 1e-8) +
-            ((gy_p - gy_t) ** 2 * m_gy).sum() / (m_gy.sum() * T + 1e-8)
+            ((gx_d - gx_r) ** 2 * m_gx).sum() / (m_gx.sum() * T + 1e-8) +
+            ((gy_d - gy_r) ** 2 * m_gy).sum() / (m_gy.sum() * T + 1e-8)
         )
 
-        # 3. Temporal tendency MSE — forces model to learn day-to-day dynamics
-        dt_p = pred[:, 1:] - pred[:, :-1]   # (B, T-1, H, W, 1)
-        dt_t = Y[:, 1:]    - Y[:, :-1]
-        m_dt = mask_t.expand(-1, T - 1, -1, -1, -1)
+        # 3. Temporal tendency MSE — per-step day-to-day change error
+        #    This is the ONLY effective way to penalize persistence-like outputs.
+        #    Pearson corr (prev. approach) measured spatial corr (≈0.98), not temporal.
+        dt_p  = pred[:, 1:] - pred[:, :-1]   # (B, T-1, H, W, 1) — predicted daily change
+        dt_t  = Y[:, 1:]    - Y[:, :-1]      # (B, T-1, H, W, 1) — true daily change
+        m_dt  = mask_t.expand(-1, T - 1, -1, -1, -1)
         loss_tend = ((dt_p - dt_t) ** 2 * m_dt).sum() / (m_dt.sum() + 1e-8)
 
-        # 4. Anti-persistence: soft penalty when model no better than naive X_last repeat
-        X_persist = X_last.expand(-1, T, -1, -1, -1)
+        # 4. Anti-persistence: penalize when model is no better than X_last repeated
+        X_persist   = X_last.expand(-1, T, -1, -1, -1)
         persist_mse = ((X_persist - Y) ** 2 * m).sum() / n_oce
-        loss_anti = F.relu(loss_mse_plain - persist_mse * 0.95)
+        loss_anti   = F.relu(loss_mse_plain - persist_mse * 0.95)
 
-        total = loss_mse + 0.3 * loss_grad + 0.5 * loss_tend + 0.2 * loss_anti
-        return total, {'mse': loss_mse_plain, 'grad': loss_grad,
-                       'tend': loss_tend, 'anti': loss_anti}
+        total = (loss_mse
+                 + 0.5 * loss_grad    # spatial structure of SST change
+                 + 5.0 * loss_tend    # dominant term: forces correct daily dynamics
+                 + 0.3 * loss_anti)
+        return total, {'mse':  loss_mse_plain,
+                       'grad': loss_grad,
+                       'tend': loss_tend,
+                       'anti': loss_anti}
 
     def training_step(self, batch, batch_idx):
         X, Y, mask = batch

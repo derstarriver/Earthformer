@@ -126,13 +126,19 @@ def _load_stats(data_dir):
 
 
 def collect_predictions(model, dataloader, device):
-    """Run inference over entire test set. Returns numpy dict."""
+    """Run inference over entire test set. Returns numpy dict.
+
+    Model outputs delta-SSTA; pred is converted to absolute SSTA here so all
+    downstream diagnostics compare apples-to-apples with truth (absolute SSTA).
+    """
     model.eval()
     all_preds, all_truths, all_inputs, all_masks = [], [], [], []
     with torch.no_grad():
         for X, Y, mask in dataloader:
             X = X.to(device)
-            pred = model(X).cpu()
+            delta_pred = model(X).cpu()                    # (B, Tout, H, W, 1) — delta
+            X_last = X[:, -1:, :, :, 0:1].cpu()           # (B, 1,    H, W, 1) — last input SSTA
+            pred = X_last + delta_pred                     # absolute SSTA, matches truth
             all_preds.append(pred)
             all_truths.append(Y)
             all_inputs.append(X.cpu())

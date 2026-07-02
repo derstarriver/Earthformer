@@ -14,7 +14,7 @@ Usage:
 
     # Training curves only
     python scripts/cuboid_transformer/nwp_sst/visualize_logs.py \
-        --exp_dir experiments/nwp_exp1/ --save curves
+        --exp_dir /home/gmm/zjj/gxy/Earthformer1/scripts/cuboid_transformer/nwp_sst/experiments/nwp_7day/ --save curves
 """
 import os
 import argparse
