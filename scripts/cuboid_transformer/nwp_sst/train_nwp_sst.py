@@ -455,59 +455,58 @@ class NWPPredictionModule(pl.LightningModule):
         Returns:
             preds      : (B, steps, H, W, 1)  predicted absolute SSTA per day
         """
+        from torch.utils.checkpoint import checkpoint as grad_ckpt
+
         B, _, H, W, _ = X.shape
-        window = X.clone()          # (B, 14, H, W, 7) — will slide forward each step
+        window = X.clone()
         preds  = []
 
         for t in range(steps):
             # ── single-step prediction ──
-            delta = self.forward(window)          # (B, 1, H, W, 1)
-            ssta_last = window[:, -1:, :, :, 0:1] # (B, 1, H, W, 1)
-            pred_t = ssta_last + delta             # absolute SSTA for day t+1
+            # gradient checkpointing: recompute activations on backward instead of storing
+            # them. Saves ~60% of per-step activation memory at ~20% speed cost.
+            if Y_teacher is not None:
+                delta = grad_ckpt(self.torch_nn_module, window, use_reentrant=False)
+            else:
+                delta = self.forward(window)          # val/test: no grad, no overhead
+
+            ssta_last = window[:, -1:, :, :, 0:1]    # (B, 1, H, W, 1)
+            pred_t    = ssta_last + delta
             preds.append(pred_t)
 
-            # ── build next SSTA for the window ──
+            # ── build next context frame ──
             if Y_teacher is not None:
-                # teacher forcing: use ground-truth SSTA to keep distribution on-manifold
-                next_ssta = Y_teacher[:, t:t+1, :, :, :]   # (B, 1, H, W, 1)
+                next_ssta = Y_teacher[:, t:t+1, :, :, :]   # teacher forcing
             else:
-                # free running: feed prediction back
                 next_ssta = pred_t.detach()
 
-            # ── build the full 7-channel next frame ──
-            # auxiliary channels (u10/v10/sla): repeat last known values
-            aux = window[:, -1:, :, :, 1:4]      # (B, 1, H, W, 3) — u10, v10, sla
+            aux = window[:, -1:, :, :, 1:4].detach()  # u10, v10, sla — no grad needed
 
-            # recompute grad_x, grad_y, advection from the new SSTA + last-known wind
-            # shapes: (B, H, W)
-            s  = next_ssta[:, 0, :, :, 0]         # (B, H, W)
-            u  = aux[:, 0, :, :, 0]               # (B, H, W) — u10 (normalized)
-            v  = aux[:, 0, :, :, 1]               # (B, H, W) — v10 (normalized)
+            s   = next_ssta[:, 0, :, :, 0]
+            u   = aux[:, 0, :, :, 0]
+            v   = aux[:, 0, :, :, 1]
 
-            # finite-difference gradients (same convention as nw_pacific_dataset.py)
             gx = torch.zeros_like(s)
             gy = torch.zeros_like(s)
-            gx[:, :, 1:-1] = (s[:, :, 2:] - s[:, :, :-2]) / 2.0   # central diff lon
-            gx[:, :, 0]    = s[:, :, 1]  - s[:, :, 0]              # forward  diff
-            gx[:, :, -1]   = s[:, :, -1] - s[:, :, -2]             # backward diff
-            gy[:, 1:-1, :] = (s[:, 2:, :] - s[:, :-2, :]) / 2.0   # central diff lat
-            gy[:, 0, :]    = s[:, 1, :]  - s[:, 0, :]
-            gy[:, -1, :]   = s[:, -1, :] - s[:, -2, :]
-            adv = -(u * gx + v * gy)               # (B, H, W)
+            gx[:, :, 1:-1] = (s[:, :, 2:] - s[:, :, :-2]) / 2.0
+            gx[:, :, 0]    =  s[:, :, 1]  - s[:, :, 0]
+            gx[:, :, -1]   =  s[:, :, -1] - s[:, :, -2]
+            gy[:, 1:-1, :] = (s[:, 2:, :] - s[:, :-2, :]) / 2.0
+            gy[:, 0, :]    =  s[:, 1, :]  - s[:, 0, :]
+            gy[:, -1, :]   =  s[:, -1, :] - s[:, -2, :]
+            adv = -(u * gx + v * gy)
 
-            # stack into (B, 1, H, W, 7)
             next_frame = torch.stack([
-                next_ssta[:, 0, :, :, 0],  # ssta
-                aux[:, 0, :, :, 0],         # u10
-                aux[:, 0, :, :, 1],         # v10
-                aux[:, 0, :, :, 2],         # sla
-                gx,                         # grad_x
-                gy,                         # grad_y
-                adv,                        # advection
-            ], dim=-1).unsqueeze(1)          # (B, 1, H, W, 7)
+                next_ssta[:, 0, :, :, 0],
+                aux[:, 0, :, :, 0],
+                aux[:, 0, :, :, 1],
+                aux[:, 0, :, :, 2],
+                gx, gy, adv,
+            ], dim=-1).unsqueeze(1)                   # (B, 1, H, W, 7)
 
-            # slide window: drop oldest day, append new frame
-            window = torch.cat([window[:, 1:], next_frame], dim=1)
+            # detach the new window so only the current step's graph is retained,
+            # not the full chain back to step 0. Gradients still flow via pred_t.
+            window = torch.cat([window[:, 1:].detach(), next_frame], dim=1)
 
         return torch.cat(preds, dim=1)   # (B, steps, H, W, 1)
 
