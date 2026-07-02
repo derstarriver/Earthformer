@@ -125,28 +125,81 @@ def _load_stats(data_dir):
     return {k: float(stats[k]) for k in stats.files}
 
 
-def collect_predictions(model, dataloader, device):
-    """Run inference over entire test set. Returns numpy dict.
+def _ar_forward(model, X, steps=7):
+    """Free-running autoregressive unrolling for `steps` days.
 
-    Model outputs delta-SSTA; pred is converted to absolute SSTA here so all
-    downstream diagnostics compare apples-to-apples with truth (absolute SSTA).
+    Mirrors NWPPredictionModule._ar_forward (Y_teacher=None path) so that
+    diagnose_model.py always evaluates the same inference path as test_step.
+
+    Args:
+        model : CuboidTransformerModel (single-step, target_shape=[1,H,W,1])
+        X     : (B, 14, H, W, 7) input context, already on the correct device
+        steps : int
+
+    Returns:
+        preds : (B, steps, H, W, 1) absolute SSTA, on CPU
+    """
+    window = X.clone()
+    preds  = []
+
+    for _ in range(steps):
+        delta      = model(window).cpu()                    # (B, 1, H, W, 1)
+        ssta_last  = window[:, -1:, :, :, 0:1].cpu()       # (B, 1, H, W, 1)
+        pred_t     = ssta_last + delta                      # absolute SSTA
+        preds.append(pred_t)
+
+        next_ssta = pred_t.to(X.device)                     # feed prediction back
+
+        # auxiliary channels: repeat last known values
+        aux = window[:, -1:, :, :, 1:4]                    # (B, 1, H, W, 3) u10/v10/sla
+
+        s = next_ssta[:, 0, :, :, 0]
+        u = aux[:, 0, :, :, 0]
+        v = aux[:, 0, :, :, 1]
+
+        gx = torch.zeros_like(s)
+        gy = torch.zeros_like(s)
+        gx[:, :, 1:-1] = (s[:, :, 2:]  - s[:, :, :-2])  / 2.0
+        gx[:, :, 0]    =  s[:, :, 1]   - s[:, :, 0]
+        gx[:, :, -1]   =  s[:, :, -1]  - s[:, :, -2]
+        gy[:, 1:-1, :] = (s[:, 2:, :]  - s[:, :-2, :]) / 2.0
+        gy[:, 0, :]    =  s[:, 1, :]   - s[:, 0, :]
+        gy[:, -1, :]   =  s[:, -1, :]  - s[:, -2, :]
+        adv = -(u * gx + v * gy)
+
+        next_frame = torch.stack([
+            next_ssta[:, 0, :, :, 0],
+            aux[:, 0, :, :, 0],
+            aux[:, 0, :, :, 1],
+            aux[:, 0, :, :, 2],
+            gx, gy, adv,
+        ], dim=-1).unsqueeze(1)                             # (B, 1, H, W, 7)
+
+        window = torch.cat([window[:, 1:], next_frame], dim=1)
+
+    return torch.cat(preds, dim=1)                          # (B, steps, H, W, 1)
+
+
+def collect_predictions(model, dataloader, device):
+    """Run inference over entire test set using free-running AR. Returns numpy dict.
+
+    Uses the same AR unrolling as NWPPredictionModule.test_step so that diagnostic
+    metrics are directly comparable to the reported test RMSE.
     """
     model.eval()
     all_preds, all_truths, all_inputs, all_masks = [], [], [], []
     with torch.no_grad():
         for X, Y, mask in dataloader:
             X = X.to(device)
-            delta_pred = model(X).cpu()                    # (B, Tout, H, W, 1) — delta
-            X_last = X[:, -1:, :, :, 0:1].cpu()           # (B, 1,    H, W, 1) — last input SSTA
-            pred = X_last + delta_pred                     # absolute SSTA, matches truth
+            pred = _ar_forward(model, X, steps=7)          # (B, 7, H, W, 1) — absolute SSTA
             all_preds.append(pred)
             all_truths.append(Y)
             all_inputs.append(X.cpu())
             all_masks.append(mask)
     return {
-        "pred": torch.cat(all_preds, dim=0).numpy(),       # (N, Tout, H, W, 1)
+        "pred": torch.cat(all_preds, dim=0).numpy(),       # (N, 7, H, W, 1)
         "truth": torch.cat(all_truths, dim=0).numpy(),
-        "input": torch.cat(all_inputs, dim=0).numpy(),     # (N, Tin, H, W, C)
+        "input": torch.cat(all_inputs, dim=0).numpy(),     # (N, 14, H, W, 7)
         "mask": torch.cat(all_masks, dim=0).numpy(),       # (N, H, W, 1)
     }
 
@@ -654,13 +707,13 @@ def exp_perturbation(model, data, device, out_dir):
 
     model.eval()
     with torch.no_grad():
-        pred_base = model(X0).cpu().numpy()    # (1, T, H, W, 1)
+        pred_base = _ar_forward(model, X0, steps=7).numpy()   # (1, 7, H, W, 1)
 
         X_pert = X0.clone()
-        X_pert[0, -1, pert_lat_idx, pert_lon_idx, 0] += 1.0   # +1 degC anomaly
-        pred_pert = model(X_pert).cpu().numpy()
+        X_pert[0, -1, pert_lat_idx, pert_lon_idx, 0] += 1.0   # +1 normalised SSTA unit
+        pred_pert = _ar_forward(model, X_pert, steps=7).numpy()
 
-    delta = (pred_pert - pred_base)[0, :, :, :, 0]   # (T, H, W)
+    delta = (pred_pert - pred_base)[0, :, :, :, 0]   # (7, H, W)
 
     # track: where does the perturbation go?
     T_out = delta.shape[0]

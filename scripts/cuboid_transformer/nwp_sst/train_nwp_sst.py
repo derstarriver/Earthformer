@@ -242,7 +242,7 @@ class NWPPredictionModule(pl.LightningModule):
         cfg = OmegaConf.create()
         cfg.data_channels = 7
         cfg.input_shape = (14, 161, 241, 7)
-        cfg.target_shape = (7, 161, 241, 1)
+        cfg.target_shape = (1, 161, 241, 1)   # single-step output; AR unrolled 7× at runtime
         cfg.base_units = 64
         cfg.scale_alpha = 1.0
         cfg.enc_depth = [2, 2, 2]
@@ -415,58 +415,149 @@ class NWPPredictionModule(pl.LightningModule):
             epoch = cls._default_optim().max_epochs
         return int(epoch * num_samples / total_batch_size)
 
-    # ── Forward ──
-    def forward(self, X, mask):
-        """X: (B, 14, 161, 241, 7) → delta_pred: (B, 7, 161, 241, 1)"""
+    # ── Forward (single step) ──
+    def forward(self, X):
+        """One autoregressive step.
+
+        X           : (B, 14, H, W, 7) — sliding context window
+        delta_pred  : (B,  1, H, W, 1) — predicted SSTA change for next day
+        """
         return self.torch_nn_module(X)
 
-    def _compute_loss(self, pred, Y, mask_t, X_last, B, T):
-        """Multi-physics loss: MSE + gradient MSE + temporal tendency MSE + anti-persistence.
+    # ── Autoregressive unrolling ──
+    def _ar_forward(self, X, steps, Y_teacher=None):
+        """Unroll the single-step model autoregressively for `steps` days.
 
-        pred, Y : (B, T, H, W, 1) — normalized SSTA
+        Training  (Y_teacher is not None) — teacher forcing:
+            At each step the input window is updated with the *true* next-day
+            SSTA (Y_teacher[:, t]), not the model's own prediction.
+            This keeps the context distribution close to real data and lets
+            gradients flow cleanly through each step without compounding error.
+
+        Val / Test  (Y_teacher is None) — free running:
+            The predicted SSTA is fed back as the SSTA channel of the next
+            window, so the model must cope with its own errors.
+
+        Window channel layout (7 channels):
+            0: ssta          ← updated each step (predicted or teacher)
+            1: u10           ┐
+            2: v10           │ kept as the last known value from X
+            3: sla           │ (we have no forecast for these auxiliaries)
+            4: grad_x        │
+            5: grad_y        ┘
+            6: advection     ← recomputed from updated ssta and u10/v10
+
+        Args:
+            X          : (B, 14, H, W, 7)  initial context
+            steps      : int, number of days to unroll (7)
+            Y_teacher  : (B, steps, H, W, 1) ground-truth SSTA, or None
+
+        Returns:
+            preds      : (B, steps, H, W, 1)  predicted absolute SSTA per day
+        """
+        B, _, H, W, _ = X.shape
+        window = X.clone()          # (B, 14, H, W, 7) — will slide forward each step
+        preds  = []
+
+        for t in range(steps):
+            # ── single-step prediction ──
+            delta = self.forward(window)          # (B, 1, H, W, 1)
+            ssta_last = window[:, -1:, :, :, 0:1] # (B, 1, H, W, 1)
+            pred_t = ssta_last + delta             # absolute SSTA for day t+1
+            preds.append(pred_t)
+
+            # ── build next SSTA for the window ──
+            if Y_teacher is not None:
+                # teacher forcing: use ground-truth SSTA to keep distribution on-manifold
+                next_ssta = Y_teacher[:, t:t+1, :, :, :]   # (B, 1, H, W, 1)
+            else:
+                # free running: feed prediction back
+                next_ssta = pred_t.detach()
+
+            # ── build the full 7-channel next frame ──
+            # auxiliary channels (u10/v10/sla): repeat last known values
+            aux = window[:, -1:, :, :, 1:4]      # (B, 1, H, W, 3) — u10, v10, sla
+
+            # recompute grad_x, grad_y, advection from the new SSTA + last-known wind
+            # shapes: (B, H, W)
+            s  = next_ssta[:, 0, :, :, 0]         # (B, H, W)
+            u  = aux[:, 0, :, :, 0]               # (B, H, W) — u10 (normalized)
+            v  = aux[:, 0, :, :, 1]               # (B, H, W) — v10 (normalized)
+
+            # finite-difference gradients (same convention as nw_pacific_dataset.py)
+            gx = torch.zeros_like(s)
+            gy = torch.zeros_like(s)
+            gx[:, :, 1:-1] = (s[:, :, 2:] - s[:, :, :-2]) / 2.0   # central diff lon
+            gx[:, :, 0]    = s[:, :, 1]  - s[:, :, 0]              # forward  diff
+            gx[:, :, -1]   = s[:, :, -1] - s[:, :, -2]             # backward diff
+            gy[:, 1:-1, :] = (s[:, 2:, :] - s[:, :-2, :]) / 2.0   # central diff lat
+            gy[:, 0, :]    = s[:, 1, :]  - s[:, 0, :]
+            gy[:, -1, :]   = s[:, -1, :] - s[:, -2, :]
+            adv = -(u * gx + v * gy)               # (B, H, W)
+
+            # stack into (B, 1, H, W, 7)
+            next_frame = torch.stack([
+                next_ssta[:, 0, :, :, 0],  # ssta
+                aux[:, 0, :, :, 0],         # u10
+                aux[:, 0, :, :, 1],         # v10
+                aux[:, 0, :, :, 2],         # sla
+                gx,                         # grad_x
+                gy,                         # grad_y
+                adv,                        # advection
+            ], dim=-1).unsqueeze(1)          # (B, 1, H, W, 7)
+
+            # slide window: drop oldest day, append new frame
+            window = torch.cat([window[:, 1:], next_frame], dim=1)
+
+        return torch.cat(preds, dim=1)   # (B, steps, H, W, 1)
+
+    def _compute_loss(self, pred, Y, mask_t, X_last):
+        """Multi-physics loss over the full 7-step AR trajectory.
+
+        pred, Y : (B, T, H, W, 1) — normalized absolute SSTA
         mask_t  : (B, 1, H, W, 1) — ocean mask
         X_last  : (B, 1, H, W, 1) — last input frame (persistence baseline)
         """
+        T = pred.shape[1]
         m = mask_t.expand(-1, T, -1, -1, -1)   # (B, T, H, W, 1)
         n_oce = m.sum()
 
-        # 1. Per-day weighted MSE — later days get higher weight to fight persistence
+        # 1. Per-day weighted MSE (later days weighted more to resist AR drift)
         day_w = torch.linspace(0.8, 1.5, T, device=pred.device).view(1, T, 1, 1, 1)
         loss_mse       = ((pred - Y) ** 2 * m * day_w).sum() / n_oce
         loss_mse_plain = ((pred - Y) ** 2 * m).sum() / n_oce
 
-        # 2. Spatial gradient MSE on DELTA only (not X_last + delta)
-        #    Reason: X_last dominates the absolute gradient, masking delta's contribution.
-        #    Computing on delta directly forces the model to output spatially structured changes.
-        delta = pred - X_last.expand(-1, T, -1, -1, -1)   # (B, T, H, W, 1) — pure delta
-        delta_t_ref = Y - X_last.expand(-1, T, -1, -1, -1)
-        gx_d = delta[:, :, :, 1:] - delta[:, :, :, :-1]         # (B, T, H, W-1, 1)
-        gx_r = delta_t_ref[:, :, :, 1:] - delta_t_ref[:, :, :, :-1]
-        gy_d = delta[:, :, 1:] - delta[:, :, :-1]               # (B, T, H-1, W, 1)
-        gy_r = delta_t_ref[:, :, 1:] - delta_t_ref[:, :, :-1]
-        m_gx = mask_t[:, :, :, 1:] * mask_t[:, :, :, :-1]       # (B, 1, H, W-1, 1)
-        m_gy = mask_t[:, :, 1:] * mask_t[:, :, :-1]             # (B, 1, H-1, W, 1)
+        # 2. Spatial gradient MSE on the delta field
+        #    delta = pred - X_last rather than pred - pred[t-1], so the gradient
+        #    signal targets cumulative spatial structure vs the persistence baseline.
+        delta     = pred - X_last.expand(-1, T, -1, -1, -1)
+        delta_ref = Y    - X_last.expand(-1, T, -1, -1, -1)
+        gx_d = delta[:, :, :, 1:]     - delta[:, :, :, :-1]      # (B,T,H,W-1,1)
+        gx_r = delta_ref[:, :, :, 1:] - delta_ref[:, :, :, :-1]
+        gy_d = delta[:, :, 1:]        - delta[:, :, :-1]          # (B,T,H-1,W,1)
+        gy_r = delta_ref[:, :, 1:]    - delta_ref[:, :, :-1]
+        m_gx = mask_t[:, :, :, 1:] * mask_t[:, :, :, :-1]        # (B,1,H,W-1,1)
+        m_gy = mask_t[:, :, 1:]     * mask_t[:, :, :-1]           # (B,1,H-1,W,1)
         loss_grad = 0.5 * (
             ((gx_d - gx_r) ** 2 * m_gx).sum() / (m_gx.sum() * T + 1e-8) +
             ((gy_d - gy_r) ** 2 * m_gy).sum() / (m_gy.sum() * T + 1e-8)
         )
 
-        # 3. Temporal tendency MSE — per-step day-to-day change error
-        #    This is the ONLY effective way to penalize persistence-like outputs.
-        #    Pearson corr (prev. approach) measured spatial corr (≈0.98), not temporal.
-        dt_p  = pred[:, 1:] - pred[:, :-1]   # (B, T-1, H, W, 1) — predicted daily change
-        dt_t  = Y[:, 1:]    - Y[:, :-1]      # (B, T-1, H, W, 1) — true daily change
-        m_dt  = mask_t.expand(-1, T - 1, -1, -1, -1)
+        # 3. Temporal tendency MSE — day-to-day change along the AR trajectory.
+        #    With AR, pred[t] genuinely depends on pred[t-1], so this loss has real
+        #    gradient pathways (unlike the parallel-decode case where it was blocked).
+        dt_p = pred[:, 1:] - pred[:, :-1]   # (B, T-1, H, W, 1)
+        dt_t = Y[:, 1:]    - Y[:, :-1]
+        m_dt = mask_t.expand(-1, T - 1, -1, -1, -1)
         loss_tend = ((dt_p - dt_t) ** 2 * m_dt).sum() / (m_dt.sum() + 1e-8)
 
-        # 4. Anti-persistence: penalize when model is no better than X_last repeated
-        X_persist   = X_last.expand(-1, T, -1, -1, -1)
-        persist_mse = ((X_persist - Y) ** 2 * m).sum() / n_oce
+        # 4. Anti-persistence
+        persist_mse = ((X_last.expand(-1, T, -1, -1, -1) - Y) ** 2 * m).sum() / n_oce
         loss_anti   = F.relu(loss_mse_plain - persist_mse * 0.95)
 
         total = (loss_mse
-                 + 0.5 * loss_grad    # spatial structure of SST change
-                 + 5.0 * loss_tend    # dominant term: forces correct daily dynamics
+                 + 0.5 * loss_grad
+                 + 5.0 * loss_tend
                  + 0.3 * loss_anti)
         return total, {'mse':  loss_mse_plain,
                        'grad': loss_grad,
@@ -475,14 +566,16 @@ class NWPPredictionModule(pl.LightningModule):
 
     def training_step(self, batch, batch_idx):
         X, Y, mask = batch
-        delta_pred = self(X, mask)                              # (B, T, H, W, 1)
-        B, T = delta_pred.shape[0], delta_pred.shape[1]
+        # Y : (B, 7, H, W, 1) — absolute SSTA ground truth
+        B = X.shape[0]
         mask_t = mask.reshape(B, 1, mask.shape[1], mask.shape[2], 1)
+        X_last = X[:, -1:, :, :, 0:1]   # (B, 1, H, W, 1)
 
-        X_last = X[:, -1:, :, :, 0:1]                          # (B, 1, H, W, 1)
-        pred   = X_last + delta_pred                            # (B, T, H, W, 1)
+        # Teacher-forced AR: each step receives the true previous SSTA as context.
+        # Gradients flow through all 7 forward passes (no detach on teacher signal).
+        pred = self._ar_forward(X, steps=PRED_LEN, Y_teacher=Y)  # (B, 7, H, W, 1)
 
-        loss, components = self._compute_loss(pred, Y, mask_t, X_last, B, T)
+        loss, components = self._compute_loss(pred, Y, mask_t, X_last)
         self.log('train_loss', loss, on_step=True, on_epoch=True)
         for k, v in components.items():
             self.log(f'train_{k}', v, on_step=False, on_epoch=True)
@@ -490,20 +583,19 @@ class NWPPredictionModule(pl.LightningModule):
 
     def validation_step(self, batch, batch_idx, dataloader_idx=0):
         X, Y, mask = batch
-        delta_pred = self(X, mask)                                     # (B, Tout, H, W, 1)
-        B, T = delta_pred.shape[0], delta_pred.shape[1]
+        B = X.shape[0]
         mask_t = mask.reshape(B, 1, mask.shape[1], mask.shape[2], 1)
+        X_last = X[:, -1:, :, :, 0:1]
 
-        X_last = X[:, -1:, :, :, 0:1]                                  # (B, 1, H, W, 1)
-        pred = X_last + delta_pred                                      # (B, Tout, H, W, 1)
+        # Free-running AR (no teacher forcing) — evaluates real inference quality
+        pred = self._ar_forward(X, steps=PRED_LEN, Y_teacher=None)  # (B, 7, H, W, 1)
 
-        loss = ((pred - Y) ** 2 * mask_t).sum() / (mask.sum() * B * T)
+        T = pred.shape[1]
+        m = mask_t.expand(-1, T, -1, -1, -1)
+        loss = ((pred - Y) ** 2 * m).sum() / (m.sum())
 
-        # Metrics over ocean only
-        pred_ocean = pred * mask_t
-        Y_ocean = Y * mask_t
-        self.valid_mse(pred_ocean, Y_ocean)
-        self.valid_mae(pred_ocean, Y_ocean)
+        self.valid_mse(pred * m, Y * m)
+        self.valid_mae(pred * m, Y * m)
         self.log('valid_loss', loss, on_step=False, on_epoch=True)
         return loss
 
@@ -518,17 +610,17 @@ class NWPPredictionModule(pl.LightningModule):
 
     def test_step(self, batch, batch_idx, dataloader_idx=0):
         X, Y, mask = batch
-        delta_pred = self(X, mask)                                     # (B, Tout, H, W, 1)
-        B, T = delta_pred.shape[0], delta_pred.shape[1]
+        B = X.shape[0]
         mask_t = mask.reshape(B, 1, mask.shape[1], mask.shape[2], 1)
 
-        X_last = X[:, -1:, :, :, 0:1]                                  # (B, 1, H, W, 1)
-        pred = X_last + delta_pred                                      # (B, Tout, H, W, 1)
+        # Free-running AR inference (same as validation — no teacher forcing)
+        pred = self._ar_forward(X, steps=PRED_LEN, Y_teacher=None)  # (B, 7, H, W, 1)
+        T = pred.shape[1]
+        m = mask_t.expand(-1, T, -1, -1, -1)
 
-        # Accumulate per-day squared error & absolute error over ocean
-        sq_err = ((pred - Y) ** 2 * mask_t).sum(dim=(0,2,3,4))  # (T,)
-        abs_err = ((pred - Y).abs() * mask_t).sum(dim=(0,2,3,4))  # (T,)
-        n_ocean = mask_t.sum()  # per-sample ocean count (same for all days)
+        sq_err  = ((pred - Y) ** 2 * m).sum(dim=(0, 2, 3, 4))   # (T,)
+        abs_err = ((pred - Y).abs() * m).sum(dim=(0, 2, 3, 4))  # (T,)
+        n_ocean = m[:, 0].sum()   # ocean pixels × B (same for every day)
         return {'sq_err': sq_err, 'abs_err': abs_err, 'n_ocean': n_ocean}
 
     def test_epoch_end(self, outputs):

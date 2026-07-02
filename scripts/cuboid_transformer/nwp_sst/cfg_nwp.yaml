@@ -1,6 +1,6 @@
 # Earthformer NW Pacific SSTA Prediction Config
 # Input:  (14, 161, 241, 7) = 14 days × 7 channels (ssta, u10, v10, sla, grad_x, grad_y, advection)
-# Output: (7, 161, 241, 1)  =  7 days × 1 channel  (ssta)
+# Output: (1,  161, 241, 1) =  1 day  × 1 channel  (ssta delta) — autoregressive, unrolled 7 steps
 
 dataset:
   data_dir: "datasets/SST-PREDICT/"
@@ -49,7 +49,7 @@ vis:
 model:
   data_channels: 7
   input_shape: [14, 161, 241, 7]
-  target_shape: [7, 161, 241, 1]
+  target_shape: [1, 161, 241, 1]
   base_units: 64
   scale_alpha: 0.4
   enc_depth: [2, 2, 2]
