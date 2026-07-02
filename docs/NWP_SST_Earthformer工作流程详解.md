@@ -1,7 +1,7 @@
 # Earthformer 西北太平洋 SSTA 预测 — 工作流程详解
 
 > 基于 `scripts/cuboid_transformer/nwp_sst/train_nwp_sst.py` 和 `cfg_nwp.yaml` 配置
-> 最后更新: 预测7天, 4通道输入, ΔSST delta prediction, 纯 Earthformer baseline (无 FFT)
+> 最后更新: 7通道物理感知输入, 多物理损失函数, 7天预测
 
 ---
 
@@ -10,20 +10,22 @@
 1. [任务定义](#1-任务定义)
 2. [数据管线](#2-数据管线)
 3. [模型架构总览](#3-模型架构总览)
-4. [初始卷积编码 (InitialEncoder)](#4-初始卷积编码)
-5. [位置编码 (PosEmbed)](#5-位置编码)
-6. [编码器 — 3层层次结构](#6-编码器)
+4. [初始卷积编码](#4-初始卷积编码)
+5. [位置编码](#5-位置编码)
+6. [编码器](#6-编码器)
 7. [Cuboid Attention 逐层策略](#7-cuboid-attention)
-8. [全局向量 (Global Vectors)](#8-全局向量)
+8. [全局向量](#8-全局向量)
 9. [解码器](#9-解码器)
-10. [最终上采样 + 投影](#10-最终上采样)
-11. [损失函数 (Δ预测 + MSE)](#11-损失函数)
+10. [最终上采样与投影](#10-最终上采样与投影)
+11. [损失函数 — 多物理损失](#11-损失函数)
 12. [评估指标](#12-评估指标)
 13. [优化器与学习率调度](#13-优化器与学习率调度)
 14. [完整数据形状流转表](#14-数据形状流转表)
 15. [配置说明](#15-配置说明)
 16. [训练流程](#16-训练流程)
-17. [Persistence Baseline](#17-persistence-baseline)
+17. [模型诊断套件](#17-模型诊断套件)
+18. [已知问题与改进方向](#18-已知问题与改进方向)
+19. [附录: 关键文件速查](#附录-关键文件速查)
 
 ---
 
@@ -31,30 +33,31 @@
 
 | 项目 | 值 |
 |------|-----|
-| 输入 | 14 天 × 161×241 × 4 通道 [ssta, u10, v10, sla] |
+| 输入 | 14 天 × 161×241 × **7 通道** [ssta, u10, v10, sla, grad_x, grad_y, advection] |
 | 输出 | 7 天 × 161×241 × 1 通道 [ssta] |
 | 区域 | 10°N–50°N, 120°E–180°E |
 | 分辨率 | 0.25° |
 | 数据源 | ERA5 (SST/Wind) + CMEMS AVISO (SLA), 2001-2025 日数据 |
-| 模型参数量 | ~10M (scale_alpha=0.5, [1,2,2] downsampling) |
+| 模型参数量 | ~10M (scale_alpha=0.4, [1,2,2] 初始下采样) |
 
-**与原始 ENSO 任务的关键区别**：
+### 与原始 ENSO 任务的区别
 
 | | ENSO (原) | NWP SSTA (当前) |
 |------|----------|-----|
-| 网格 | 24×48 | 161×241 (34×更大) |
+| 网格 | 24×48 | 161×241 |
 | 输入长度 | 12 月 | 14 天 |
 | 输出长度 | 26 月 | 7 天 |
-| 输入通道 | 4 (sst, t300, ua, va) | 4 (ssta, u10, v10, sla) |
+| 输入通道 | 4 (sst, t300, ua, va) | **7** (ssta, u10, v10, sla, **grad_x, grad_y, advection**) |
 | 输出通道 | 4 | 1 (仅 ssta) |
-| 编码器层数 | 2 层 | 3 层 |
+| 编码器层数 | 2 | 3 |
 | 注意力策略 | 全 axial | 逐层不同 |
-| 全局向量 | 关闭 | 开启 (8 个) |
-| 初始下采样 | [1,1,2] | [1,2,2] (可变) |
-| scale_alpha | — | 0.5 |
+| 全局向量 | 关闭 | 8 个 |
+| 初始下采样 | [1,1,2] | [1,4,4] |
+| scale_alpha | — | 0.4 |
 | 参数量 | ~7M | ~10M |
+| 损失函数 | MSE | **多物理损失** (MSE + 梯度 + 时间趋势 + 反持续性) |
 | 步长 | 1 | 3 (训练集) |
-| 评估 | Niño 相关系数 | 逐像素 SSTA MSE/MAE/RMSE (°C) |
+| 评估 | Niño 相关系数 | 逐像素 RMSE/MAE (°C)，10项诊断套件 |
 
 ---
 
@@ -62,7 +65,7 @@
 
 ### 2.1 数据来源
 
-ERA5 (SST/Wind) + CMEMS AVISO (SLA)，经过以下预处理步骤（各脚本独立运行）：
+ERA5 (SST/Wind) + CMEMS AVISO (SLA)，经过以下预处理步骤：
 
 | 步骤 | 脚本 | 输入 → 输出 |
 |------|------|-----------|
@@ -70,209 +73,194 @@ ERA5 (SST/Wind) + CMEMS AVISO (SLA)，经过以下预处理步骤（各脚本独
 | 海陆掩码 | `generate_ocean_mask.py` | SST_cropped.nc → mask.npy |
 | 逐日气候态 | `compute_climatology.py` | SST_cropped.nc → climatology.nc |
 | SSTA 计算 | `compute_ssta.py` | SST_cropped.nc + climatology.nc → ssta.nc |
-| SLA 预处理 | `preprocess_sla.py` | sladata/ 四子目录 → SLA_cropped.nc |
+| SLA 预处理 | `preprocess_sla.py` | sladata/ → SLA_cropped.nc |
 
 ### 2.2 训练时数据加载
 
 **文件**: `src/earthformer/datasets/nw_pacific_dataset.py`
 
-**函数**: `build_dataloaders(data_dir, batch_size, num_workers)`
+**函数**: `build_dataloaders(data_dir, batch_size, num_workers)` → `(train, val, test, stats)`
 
 **处理流程**：
 
 ```
 1. 读取 ssta.nc + Wind_cropped.nc + SLA_cropped.nc + mask.npy
        ↓
-2. 归一化 (仅用训练集 2001-2022 计算 mean/std)
+2. 归一化 (仅用训练集 2001-2022 计算 per-channel mean/std)
    ssta = (ssta - mean) / std
    u10  = (u10  - mean) / std
    v10  = (v10  - mean) / std
-   sla  = (sla  - mean) / std       ← 新增, NaN-safe
+   sla  = (sla  - mean) / std
        ↓
 3. 掩码陆地 (归一化后) → 陆地值 ≡ 0
-   ssta = np.where(mask, ssta, 0.0)
-   u10  = np.where(mask, u10,  0.0)
-   v10  = np.where(mask, v10,  0.0)
-   sla  = np.where((mask>0) & ~np.isnan(sla), sla, 0.0)  ← 双重掩码
        ↓
-4. 堆叠通道
-   data = stack([ssta, u10, v10, sla], axis=-1)  → (9131, 161, 241, 4)
+4. 计算物理派生通道 (仅海洋, 训练集统计归一化)
+   grad_x    = ∂(SSTA)/∂lon, z-score normalized
+   grad_y    = ∂(SSTA)/∂lat, z-score normalized
+   advection = -(u10·∇SSTA), z-score normalized   ← 风驱平流项
        ↓
-5. 按年切分
+5. 堆叠 7 通道
+   data = stack([ssta, u10, v10, sla, grad_x, grad_y, advection]) → (T, 161, 241, 7)
+       ↓
+6. 按年切分
    训练: 2001-2022 (8035天 → ~2672样本, stride=3)
    验证: 2023-2024 (731天  → ~715样本, stride=1)
    测试: 2025        (365天  → ~349样本, stride=1)
        ↓
-6. 滑窗采样 (NWPacificDataset, stride=3 for train)
-   每个样本: 14天输入 + 7天输出 = 21天窗口
-   stride=3: 训练样本每隔3天采样一次, 减少重叠
-   __getitem__ 实时切片, 不复制数据
+7. 滑窗采样 (NWPacificDataset)
+   每样本: 14天输入 + 7天输出 = 21天窗口
+   stride=3: 训练降低样本相关性, 防过拟合
        ↓
-7. DataLoader → (B, 14, 161, 241, 4), (B, 7, 161, 241, 1), mask
+8. DataLoader → (B, 14, 161, 241, 7), (B, 7, 161, 241, 1), mask
 ```
 
-**标准化统计量**：首次运行时保存为 `normalization_stats.npz`，后续直接加载。含 4 通道统计: `ssta_mean/std`, `u10_mean/std`, `v10_mean/std`, `sla_mean/std`。
+### 2.3 物理通道的设计动机
+
+| 通道 | 物理意义 | 解决的问题 |
+|------|---------|-----------|
+| `grad_x` (∂SSTA/∂lon) | 东西向温度梯度 | 帮助 attention 区分锋面和均匀区 |
+| `grad_y` (∂SSTA/∂lat) | 南北向温度梯度 | 同上，保流场方向性 |
+| `advection` (-u·∇SSTA) | 风驱平流趋势 | 显式注入物理动力学信号，避免纯数据驱动 |
+
+**原理**: Attention 对 SSTA 的加权求和天然趋向平滑，显式提供梯度通道相当于给模型"指路"——高梯度区域应保持锐利。每个派生通道独立进行 z-score 归一化（用训练集海洋像素统计），确保与基础 4 通道尺度一致。
+
+**标准化统计量**: 保存为 `normalization_stats.npz`，包含 per-channel mean/std。旧版 4 通道统计自动兼容，新通道（grad_x/grad_y/advection）的统计在 `build_data_array` 中按需计算。
 
 ---
 
 ## 3. 模型架构总览
 
-> 以下形状基于 `scale_alpha: 0.5` + `initial_downsample_scale: [1,2,2]`。
-> 不同配置下具体 dim 和 spatial size 会变化，原则不变。
-
 ```
-输入 (B, 14, 161, 241, 4)           14天 × 161lat × 241lon × 4通道
+输入 (B, 14, 161, 241, 7)
    │
    ▼
 ┌──────────────────────────────────────┐
 │ InitialEncoder                       │
-│  Conv2D×3 → PatchMerging3D(1,2,2)    │  H:161→81, W:241→121, C:4→64
+│  Conv2D×3 → PatchMerging3D(1,4,4)   │
 └──────────────────────────────────────┘
-   │ (B, 14, 81, 121, 64)
+   │ (B, 14, 41, 61, 64)
    ▼
 ┌──────────────────────────────────────┐
-│ Encoder PosEmbed (t+h+w)             │  可学习位置嵌入
+│ Encoder PosEmbed (t+h+w)             │
 └──────────────────────────────────────┘
    │
    ▼
 ┌──────────────────────────────────────┐
 │ Encoder Block 0  [axial, dim=64]     │
-│  2 × CuboidSelfAttentionLayer        │  轴向注意力
-│    + PositionwiseFFN (hidden=256)    │
+│  2 × CuboidSelfAttentionLayer        │
+│    + PositionwiseFFN                 │
 └──────────────────────────────────────┘
-   │ (B, 14, 81, 121, 64)  → mem[0]
-   ▼ PatchMerge(1,2,2)  H:81→41, W:121→61
-   │ (B, 14, 41, 61, ~90)
+   │ (B, 14, 41, 61, 64)  → mem[0]
+   ▼ PatchMerge(1,2,2)
+   │ (B, 14, 21, 31, ~80)
    ▼
 ┌──────────────────────────────────────┐
-│ Encoder Block 1  [spatial_lg_8, dim≈90] │
-│  2 × CuboidSelfAttentionLayer        │  空间局部+膨胀注意力
-│    + PositionwiseFFN (hidden≈360)    │
+│ Encoder Block 1  [spatial_lg_8, dim≈80] │
+│  2 × CuboidSelfAttentionLayer        │
 └──────────────────────────────────────┘
-   │ (B, 14, 41, 61, ~90)  → mem[1]
-   ▼ PatchMerge(1,2,2)  H:41→21, W:61→31
-   │ (B, 14, 21, 31, 128)
+   │ (B, 14, 21, 31, ~80)  → mem[1]
+   ▼ PatchMerge(1,2,2)
+   │ (B, 14, 11, 16, ~97)
    ▼
 ┌──────────────────────────────────────┐
-│ Encoder Block 2  [divided_st, dim=128] │
-│  2 × CuboidSelfAttentionLayer        │  时空分离注意力
-│    + PositionwiseFFN (hidden=512)    │
+│ Encoder Block 2  [divided_st, dim≈97] │
+│  2 × CuboidSelfAttentionLayer        │
 └──────────────────────────────────────┘
-   │ (B, 14, 21, 31, 128)  → mem[2]
+   │ (B, 14, 11, 16, ~97)  → mem[2]
    │
    │  多尺度记忆: mem[0], mem[1], mem[2]
-   │  全局向量: 8 × 64维, 逐层传播更新
+   │  全局向量: 8 × 64维, 逐层传播
    │
    ▼
 ┌──────────────────────────────────────┐
 │ Decoder Init (z_init=zeros)          │
-│  zeros(7, 21, 31, 128) + PosEmbed    │
-│  → z_proj: Linear(128, 128)         │
+│  zeros(7, 11, 16, ~97) + PosEmbed    │
 └──────────────────────────────────────┘
-   │ (B, 7, 21, 31, 128)
+   │
    ▼
 ┌──────────────────────────────────────┐
-│ Decoder Block 2 (最深层)              │
-│  dec_use_first_self_attn=False        │  先 cross → mem[2]
-│  cross_attn: cross_1x1               │  T_dec=7 vs T_enc=14
-│  2 × (self_attn: divided_st + FFN)   │
+│ Decoder Block 2 → cross(mem[2])      │
 └──────────────────────────────────────┘
-   │ Upsample3DLayer: (21,31)→(41,61), 128→~90
+   │ Upsample
    ▼
 ┌──────────────────────────────────────┐
-│ Decoder Block 1                      │
-│  2 × (self_attn: spatial_lg_8 +      │
-│       cross_attn: cross_1x1 → mem[1])│
+│ Decoder Block 1 → cross(mem[1])      │
 └──────────────────────────────────────┘
-   │ Upsample3DLayer: (41,61)→(81,121), ~90→64
+   │ Upsample
    ▼
 ┌──────────────────────────────────────┐
-│ Decoder Block 0 (最浅层)              │
-│  2 × (self_attn: axial +             │
-│       cross_attn: cross_1x1 → mem[0])│
+│ Decoder Block 0 → cross(mem[0])      │
 └──────────────────────────────────────┘
-   │ (B, 7, 81, 121, 64)
+   │ (B, 7, 41, 61, 64)
    ▼
 ┌──────────────────────────────────────┐
 │ FinalDecoder                         │
-│  Upsample3DLayer → Conv2D×2          │  恢复空间: 81→161, 121→241
+│  Upsample → Conv2D×2                 │
 └──────────────────────────────────────┘
    │ (B, 7, 161, 241, 64)
    ▼
 ┌──────────────────────────────────────┐
-│ dec_final_proj: Linear(64, 1)        │  逐像素投影到SSTA
+│ dec_final_proj: Linear(64, 1)        │
 └──────────────────────────────────────┘
    │
    ▼
-输出 (B, 7, 161, 241, 1)             7天预测 ΔSSTA (delta prediction)
-                                      → training_step 中 X_last + Δ → absolute SST
+输出: ΔSSTA (B, 7, 161, 241, 1) → training_step: X_last + Δ = absolute SST
 ```
 
 ---
 
-## 4. 初始卷积编码 (InitialEncoder)
-
-**源码**: `cuboid_transformer.py`
+## 4. 初始卷积编码
 
 **配置**:
 ```yaml
 initial_downsample_type: "conv"
-initial_downsample_scale: [1, 2, 2]     # H:2×, W:2×, T:不变
-initial_downsample_conv_layers: 3       # 3层Conv2D
+initial_downsample_scale: [1, 4, 4]      # H:4×, W:4×, T:不变
+initial_downsample_conv_layers: 3
 initial_downsample_activation: "leaky"
 ```
 
-**详细流程**:
-
+**流程**:
 ```
-输入: (B, 14, 161, 241, 4)
+输入: (B, 14, 161, 241, 7)
 
 Step 1: 展平时空维度
-    reshape → (B×14, 161, 241, 4)
-    permute → (B×14, 4, 161, 241)   # (N, C, H, W)
+    reshape → (B×14, 161, 241, 7)
+    permute → (B×14, 7, 161, 241)
 
-Step 2: Conv2D×3 (K=3, S=1, P=1, GroupNorm(16)+LeakyReLU)
-    Conv0: 4 → 64, GroupNorm, LeakyReLU      ← 第4通道(SLA) kernel 随机初始化
-    Conv1: 64 → 64, GroupNorm, LeakyReLU
-    Conv2: 64 → 64, GroupNorm, LeakyReLU
-    空间尺寸保持: 161×241
+Step 2: Conv2D×3 (3×3, GroupNorm+LeakyReLU)
+    Conv0: 7 → 64
+    Conv1: 64 → 64
+    Conv2: 64 → 64
 
-Step 3: 恢复时空格式
-    permute → (B×14, 161, 241, 64)
-    reshape → (B, 14, 161, 241, 64)
+Step 3: 恢复
+    permute + reshape → (B, 14, 161, 241, 64)
 
-Step 4: PatchMerging3D(1,2,2)
-    H: 161→81 (pad 1 → 162/2=81)
-    W: 241→121 (pad 1 → 242/2=121)
-    通道: 不变 (out_dim=base_units=64)
+Step 4: PatchMerging3D(1,4,4)
+    H: 161→41, W: 241→61
 
-输出: (B, 14, 81, 121, 64)
+输出: (B, 14, 41, 61, 64)
 ```
 
 ---
 
-## 5. 位置编码 (PosEmbed)
+## 5. 位置编码
 
 **配置**: `pos_embed_type: "t+h+w"`
 
-三个独立的可学习 Embedding 表，分别对应时间、高度（纬度）、宽度（经度）三个轴：
-
+三个独立的可学习 Embedding 表:
 ```python
 T_embed: nn.Embedding(maxT=14, embed_dim=dim)
 H_embed: nn.Embedding(maxH=H,  embed_dim=dim)
 W_embed: nn.Embedding(maxW=W,  embed_dim=dim)
 
-前向传播:
-    x = x + T_embed([0..13]).reshape(14, 1, 1, dim)
-          + H_embed([0..H-1]).reshape(1, H, 1, dim)
-          + W_embed([0..W-1]).reshape(1, 1, W, dim)
+x = x + T_embed + H_embed + W_embed
 ```
 
-encoder 中只加一次，decoder 中每层上采样后可选重新加（`dec_hierarchical_pos_embed: true`）。
+Encoder 中加一次；Decoder 各层上采样后重加 (`dec_hierarchical_pos_embed: true`)。
 
 ---
 
-## 6. 编码器 — 3层层次结构
+## 6. 编码器
 
 **源码**: `CuboidTransformerEncoder`, `cuboid_transformer.py`
 
@@ -280,334 +268,261 @@ encoder 中只加一次，decoder 中每层上采样后可选重新加（`dec_hi
 ```yaml
 enc_depth: [2, 2, 2]    # 3层, 每层2个attention block
 downsample: 2           # 块间 PatchMerge (1,2,2)
-base_units: 64          # 基础通道数
-scale_alpha: 0.5        # 通道增长速度减半
+base_units: 64
+scale_alpha: 0.4        # 通道增长减速, 控制参数量
 ```
 
-**通道数自动计算** (`scale_alpha: 0.5`):
+**通道数** (`scale_alpha: 0.4`):
 ```
-Block 0: int(64 × 2^(0×0.5)) = 64
-Block 1: int(64 × 2^(1×0.5)) ≈ 90
-Block 2: int(64 × 2^(2×0.5)) = 128
-```
-> `scale_alpha=1.0` 时通道数为 64→128→256，参数约 18.4M。
-> `scale_alpha=0.5` 时降为 64→90→128，参数约 10M，有效缓解过拟合。
-
-**分辨率变化** (以 [1,2,2] initial downsampling 为例):
-```
-输入编码器: (14, 81, 121, 64)
-  Block 0 (axial):         (14, 81, 121, 64)   → mem[0]
-  PatchMerge(1,2,2):       (14, 41, 61, ~90)
-  Block 1 (spatial_lg_8):  (14, 41, 61, ~90)   → mem[1]
-  PatchMerge(1,2,2):       (14, 21, 31, 128)
-  Block 2 (divided_st):    (14, 21, 31, 128)   → mem[2]
+Block 0: int(64 × 2^(0×0.4)) = 64
+Block 1: int(64 × 2^(1×0.4)) ≈ 80
+Block 2: int(64 × 2^(2×0.4)) ≈ 97
 ```
 
-**mem_l 多尺度记忆**：每个编码器块的输出都保存，供解码器各层跨注意力使用：
+**分辨率变化** (`initial_downsample_scale: [1,4,4]`):
 ```
-mem[0]: (B, 14, 81, 121, 64)   ← 高分辨率, 浅语义, 解码器浅层使用
-mem[1]: (B, 14, 41, 61, ~90)   ← 中分辨率, 解码器中层使用
-mem[2]: (B, 14, 21, 31, 128)   ← 低分辨率, 深语义, 解码器深层使用
+输入编码器: (14, 41, 61, 64)
+  Block 0 (axial):         (14, 41, 61, 64)   → mem[0]
+  PatchMerge(1,2,2):       (14, 21, 31, ~80)
+  Block 1 (spatial_lg_8):  (14, 21, 31, ~80)   → mem[1]
+  PatchMerge(1,2,2):       (14, 11, 16, ~97)
+  Block 2 (divided_st):    (14, 11, 16, ~97)   → mem[2]
+```
+
+**多尺度记忆**: 每层输出保存供解码器跨注意力使用:
+```
+mem[0]: (B, 14, 41, 61, 64)   ← 高分辨率, 浅语义 → Dec Block 0
+mem[1]: (B, 14, 21, 31, ~80)  ← 中分辨率         → Dec Block 1
+mem[2]: (B, 14, 11, 16, ~97)  ← 低分辨率, 深语义 → Dec Block 2
 ```
 
 ---
 
 ## 7. Cuboid Attention — 逐层策略
 
-**当前配置**:
+**配置**:
 ```yaml
 self_pattern:       ["axial", "spatial_lg_8", "divided_st"]
 cross_self_pattern: ["axial", "spatial_lg_8", "divided_st"]
 cross_pattern:      ["cross_1x1", "cross_1x1", "cross_1x1"]
 ```
 
-### 7.1 Block 0: axial 注意力
+### 7.1 Block 0: axial
+- T-full (14, 1, 1) + H-full (1, H, 1) + W-full (1, 1, W)
+- 最浅层最大网格，轴向分解最省计算
 
-**输入空间**: 81×121 (或 41×61, 取决于 initial_downsample_scale)
+### 7.2 Block 1: spatial_lg_8
+- T-full (14, 1, 1) + local 8×8 + dilated 8×8
+- 局部保纹理，膨胀扩大感受野
 
-3 个独立长方体:
-- cuboid_1: (14, 1, 1) → 完整时间轴注意力
-- cuboid_2: (1, H, 1) → 完整纬度轴注意力
-- cuboid_3: (1, 1, W) → 完整经度轴注意力
+### 7.3 Block 2: divided_st
+- T-full (14, 1, 1) + full spatial (1, H, W)
+- 最深最小分辨率，全空间 attention token 数可控
 
-**目的**: 最大空间网格，轴向分解最省计算。T-轴捕获时间演化，H/W-轴各自捕获空间方向依赖。
-
-### 7.2 Block 1: spatial_lg_8 注意力
-
-3 个长方体:
-- cuboid_1: (14, 1, 1) → 完整时间轴 (local)
-- cuboid_2: (1, 8, 8) → 局部8×8窗口 (local)
-- cuboid_3: (1, 8, 8) → 膨胀8×8窗口 (dilated, 跨窗口通信)
-
-**目的**: 局部窗口保纹理（涡旋、锋面），膨胀窗口扩大感受野。
-
-### 7.3 Block 2: divided_st 注意力
-
-2 个长方体:
-- cuboid_1: (14, 1, 1) → 完整时间轴注意力
-- cuboid_2: (1, H, W) → 全空间注意力
-
-**目的**: 最小空间网格，全空间注意力 token 数可控。捕捉大尺度气候模态（ENSO、PDO 等）。
-
-### 7.4 跨注意力 (cross_1x1)
-
-**所有三层统一使用**:
+### 7.4 跨注意力: cross_1x1 (全三层)
 ```
-cuboid_hw = (1, 1)     → 逐像素跨注意力
-n_temporal = 1          → 解码器各步独立跨注意力
-strategy = ('l','l','l') → 全局部
+cuboid_hw = (1, 1)      → 逐像素跨注意力
+Q 来自 Decoder (7天), K/V 来自 Encoder memory (14天)
 ```
-
-**Q 来自解码器**: T_out 个预测步 × 当前空间分辨率
-**K/V 来自编码器记忆**: 14 步历史编码
-
-从 3 天改为 7 天: 解码器 cross-attention 步数从 3→7, 计算量同比增加。
 
 ---
 
-## 8. 全局向量 (Global Vectors)
+## 8. 全局向量
 
 **配置**:
 ```yaml
-num_global_vectors: 8              # 8个可学习向量
-use_dec_self_global: true          # 解码器自注意力中使用
-dec_self_update_global: true       # 解码器可更新全局向量
-use_dec_cross_global: true         # 解码器跨注意力中使用
-use_global_vector_ffn: true        # 全局向量通过FFN
-use_global_self_attn: false        # 全局向量之间不做自注意力
-global_dim_ratio: 1                # 全局向量维度 = 基础通道数
+num_global_vectors: 8
+use_dec_self_global: true
+dec_self_update_global: true
+use_dec_cross_global: true
+use_global_vector_ffn: true
+use_global_self_attn: false
 ```
 
-**本质**: 8 个全局向量相当于"信使"，在各个 cuboid 之间传递长距离信息。Cuboid 内部做 local attention，跨 cuboid 通信通过这 8 个向量中转。
+8 个可学习向量在各 cuboid 之间传递长距离信息。Cuboid 内部做 local attention，跨 cuboid 通过这 8 个向量中转。
 
 ---
 
 ## 9. 解码器
 
-**源码**: `CuboidTransformerDecoder`, `cuboid_transformer.py`
-
 **配置**:
 ```yaml
 dec_depth: [2, 2, 2]
-dec_use_first_self_attn: false    # 最深层先cross后self
-dec_hierarchical_pos_embed: true  # 每层上采样后重加位置编码
+dec_use_first_self_attn: false    # Block 2 先cross后self
+dec_hierarchical_pos_embed: true  # 上采样后重加位置编码
 ```
 
-**解码流程** (从上到下, 3 个 block, T_out=7):
+解码器从零向量 `zeros(7, H, W, dim)` + 位置编码初始化，3 层逐级上采样（nearest + Conv2D），每层 cross-attend 对应 encoder memory。
+
+---
+
+## 10. 最终上采样与投影
 
 ```
-初始化: zeros(7, H3, W3, dim2) + PosEmbed → z_proj→Linear(dim2, dim2)
-
-Block 2 (i=2, 最深层, T=7, dim=128):
-    dec_use_first_self_attn=false:
-        Layer 0: cross_attn(cross_1x1) → mem[2] (14, H3, W3, 128)
-        然后 self_attn(divided_st)
-        Layer 1: self_attn → cross_attn
-    输出: (7, H3, W3, 128)
-
-↓ Upsample3DLayer: (H3,W3)→(H1,W1), 128→dim1
-
-Block 1 (i=1, T=7, dim=dim1≈90):
-    Layer 0: self_attn(spatial_lg_8) → cross_attn → mem[1]
-    Layer 1: 同上
-    输出: (7, H1, W1, dim1)
-
-↓ Upsample3DLayer: (H1,W1)→(H0,W0), dim1→64
-
-Block 0 (i=0, 最浅层, T=7, dim=64):
-    Layer 0: self_attn(axial) → cross_attn → mem[0]
-    Layer 1: 同上
-    输出: (7, H0, W0, 64)
-```
-
-**上采样机制** (Upsample3DLayer):
-```
-输入: (B, T, H, W, C)
-  reshape(B×T, H, W, C) → permute(B×T, C, H, W)
-  → nn.Upsample(nearest, size=(H_target, W_target))
-  → Conv2D(3×3, C_in→C_out)
-  → permute + reshape → (B, T, H_target, W_target, C_out)
+(B, 7, 41, 61, 64)
+  → Upsample3DLayer → (B, 7, 161, 241, 64)
+  → Conv2D×2 (GroupNorm+LeakyReLU)
+  → dec_final_proj: Linear(64, 1) → (B, 7, 161, 241, 1)
 ```
 
 ---
 
-## 10. 最终上采样 + 投影
+## 11. 损失函数 — 多物理损失
 
-**配置**:
-```yaml
-final_upsample_conv_layers: 2    # 2层Conv2D精细化
-```
-
-**流程**:
-```
-输入: (B, 7, H0, W0, 64)
-
-Step 1: Upsample3DLayer
-    目标: (7, 161, 241)
-    nearest upsampling + Conv2D(3×3)
-    → (B, 7, 161, 241, 64)
-
-Step 2: Conv2D×2 (GroupNorm+LeakyReLU)
-    reshape(B×7, 161, 241, 64) → permute → conv_block → permute回
-    → (B, 7, 161, 241, 64)
-
-Step 3: 最终投影
-    dec_final_proj: Linear(64, 1)
-    → (B, 7, 161, 241, 1)
-```
-
----
-
-## 11. 损失函数 (Δ预测 + MSE)
-
-模型输出为 ΔSST（相对于输入最后一天的 SSTA 变化量），loss 计算前转换为绝对 SST:
+**当前实现** (`_compute_loss` in `train_nwp_sst.py`):
 
 ```python
-def training_step(self, batch, batch_idx):
-    X, Y, mask = batch
-    delta_pred = self(X, mask)                                     # (B, Tout, H, W, 1)
-    B, T = delta_pred.shape[0], delta_pred.shape[1]
-    mask_t = mask.reshape(B, 1, mask.shape[1], mask.shape[2], 1)
+pred = X_last + delta_pred   # Δ → 绝对 SSTA
 
-    X_last = X[:, -1:, :, :, 0:1]                                  # (B, 1, H, W, 1)
-    pred = X_last + delta_pred                                      # (B, Tout, H, W, 1)
+# 1. 逐天加权 MSE (基础损失)
+day_w = linspace(0.8, 1.5, 7)       # 远期预测权重更高，抵销 persistence drift
+loss_mse = MSE(pred, Y, weight=day_w)
 
-    loss = ((pred - Y) ** 2 * mask_t).sum() / (mask.sum() * B * T)
-    #                                          ^^^^^^^^^^^^^^^^^^^
-    #                                          /ocean_pixels /B /T
+# 2. 空间梯度 MSE（在纯 delta 上计算）
+delta = pred - X_last
+delta_ref = Y - X_last
+loss_grad = MSE(grad(delta), grad(delta_ref))   # 逼迫 delta 具有正确的空间结构
+
+# 3. 时间趋势 MSE（逐日变化量）
+dt_pred = pred[t+1] - pred[t]
+dt_true = Y[t+1] - Y[t]
+loss_tend = MSE(dt_pred, dt_true)    # main term preventing persistence shortcut
+
+# 4. 反持续性惩罚
+loss_anti = relu(loss_mse_plain - 0.95 × persist_mse)  # 模型不能比 persistence 差
+
+total = loss_mse + 0.5 × loss_grad + 5.0 × loss_tend + 0.3 × loss_anti
 ```
 
-**逐步解析**:
+### 设计动机
 
-1. `delta_pred = model(X)` — 模型输出 7 天 ΔSST
-2. `X_last = X[:, -1, :, :, 0]` — 取输入最后一天的 SSTA
-3. `pred = X_last + delta_pred` — Δ → 绝对 SST（广播）
-4. `(pred - Y)²` — 所有格点 (海洋+陆地) 的平方误差
-5. `* mask_t` — 陆地格点权重清零
-6. `.sum()` — 对全部 (B, T, H, W, C) 求和
-7. `/ mask.sum()` — 除以单样本海洋格点数
-8. `/ B` — 除以 batch size，得到**每样本**
-9. `/ T` — 除以预测天数 (7)，得到**每像素每天**
+| 损失项 | 权重 | 解决的核心问题 |
+|--------|------|--------------|
+| `loss_mse` | 1.0 | 基础预测精度 |
+| `loss_grad` | 0.5 | 锋面抹平 — 惩罚 delta 的空间梯度方向错误 |
+| `loss_tend` | **5.0** | 时间复制 — 强制每日变化量匹配真实动力学 |
+| `loss_anti` | 0.3 | 退化防护 — 确保模型至少不比 persistence 差 |
 
-**Δ预测的设计目的**: 直接预测 SST(t+1:t+7) 时模型可能退化为"均值回归器"（只记住气候态 SST 分布）。Δ预测强制模型学习变化量，验证其是否真正学到了时间动力学。
+### 关键设计决策
+
+- **梯度损失在 delta 上计算而非绝对 SSTA**: `X_last` 的空间梯度主导 `pred` 的梯度，会导致 loss_grad 变成常数。在纯 `delta` 上计算使梯度信号聚焦于模型实际预测的变化场空间结构。
+- **趋势损失用 MSE 而非 Pearson 相关**: 早期版本使用 `_masked_pearson`，但打平 `B×(T-1)×H×W` 后计算的 Pearson 实际上是测量空间模式相关 (≈0.98)，而不是时间动态相关 (≈0.09)。纯 MSE 直接惩罚 `dt_pred ≈ 0` 这种 persistence-like 输出。
+- **λ_tend = 5.0**: 趋势项必须为主导项，否则模型会找到 `delta[t] ≈ delta[t±1]` 的局部极小。
+
+### 训练监控日志
+
+除 `train_loss` 外，额外 log 四个分量：
+```
+train_mse, train_grad, train_tend, train_anti
+```
+用于判断哪个物理约束在主导训练。正常训练初期 `train_tend` 应在 0.08-0.15 间，随训练下降。
 
 ---
 
 ## 12. 评估指标
 
-### 12.1 训练/验证时 (归一化空间)
+### 12.1 训练/验证 (归一化空间)
 
 ```python
-self.valid_mse(pred_ocean, Y_ocean)  # torchmetrics.MeanSquaredError
-self.valid_mae(pred_ocean, Y_ocean)  # torchmetrics.MeanAbsoluteError
+self.valid_mse(pred_ocean, Y_ocean)   # torchmetrics
+self.valid_mae(pred_ocean, Y_ocean)
+self.log('valid_loss', plain_mse)     # 纯 MSE (无物理分量) 用于 checkpoint 选择
 ```
 
-torchmetrics 对所有像素（含陆地=0）求均值。`valid_mse_epoch` 用于 checkpoint 选择。
+Checkpoint 选择依据: `valid_mse_epoch` (min mode)。
 
-### 12.2 测试时 (分天指标, 转换°C)
+### 12.2 测试 (分天, °C 转换)
 
 ```python
-# 累计每天的平方误差和绝对误差
-sq_err = ((pred - Y) ** 2 * mask_t).sum(dim=(0,2,3,4))   # (T_out,) 每天独立
-abs_err = ((pred - Y).abs() * mask_t).sum(dim=(0,2,3,4))  # (T_out,)
+# 累计每天的平方误差
+sq_err = ((pred - Y)² × mask).sum(dim=(0,2,3,4))   # (7,)
+abs_err = ((pred - Y).abs() × mask).sum(dim=(0,2,3,4))
 
-# 全局归一化: sum over batches → divide by total ocean pixels
-n_total = sum(mask_t.sum() for each batch)  # = total_samples × ocean_pixels_per_sample
-mse_per_day = total_sq_err / n_total         # (T_out,) per-pixel MSE
+# 全局归一化
+n_total = Σ mask.sum() over batches
+mse_per_day = sq_err / n_total
 
-# 转换为°C
-mse_degC = mse_per_day × ssta_std²
-rmse_degC = sqrt(mse_degC)
-mae_degC = mae_per_day × ssta_std
+# 转摄氏度
+rmse_degC = sqrt(mse_per_day × ssta_std²)
+mae_degC  = mae_per_day × ssta_std
 ```
 
-**输出示例**（7天预报）:
+输出示例:
 ```
   Day   MSE( norm )    MAE( norm )   RMSE(°C)    MAE(°C)
     1     0.xxxxxx       0.xxxxxx      0.xxxx       0.xxxx
-    2     0.xxxxxx       0.xxxxxx      0.xxxx       0.xxxx
-    ...
+   ...
     7     0.xxxxxx       0.xxxxxx      0.xxxx       0.xxxx
   avg     0.xxxxxx       0.xxxxxx      0.xxxx       0.xxxx
 ```
+
+结果保存至 `test_metrics.csv`。
 
 ---
 
 ## 13. 优化器与学习率调度
 
-### 13.1 AdamW
-
+### AdamW
 ```
 lr = 1e-4, weight_decay = 1e-4
 
 参数分组:
-    Group 1 (有衰减): 非LayerNorm参数,非bias → weight_decay = 1e-4
-    Group 2 (无衰减): LayerNorm参数 + bias → weight_decay = 0
+  Group 1 (含 weight_decay): 非 LayerNorm, 非 bias
+  Group 2 (无 weight_decay): LayerNorm + bias
 ```
 
-### 13.2 两阶段学习率
-
+### 两阶段调度
 ```
-Phase 1 — Warmup (前10%步数):
-    lr: 0 → 1e-4 (线性增长)
-
-Phase 2 — Cosine Annealing (后90%步数):
-    lr: 1e-4 → 1e-7 (余弦退火)
-
-总步数 ≈ max_epochs × num_train_samples / total_batch_size
-       ≈ 50 × ~2672 / 16 ≈ 8,350 steps  (stride=3)
+Warmup (10%):  lr 0 → 1e-4 (线性)
+Cosine (90%):  lr 1e-4 → 1e-4 × min_lr_ratio (余弦衰减)
 ```
 
-### 13.3 正则化
-
+### 正则化
 ```yaml
-attn_drop: 0.2       # 注意力 dropout
-proj_drop: 0.2       # 投影 dropout
-ffn_drop: 0.3        # FFN dropout (最深层FFN参数量大, 用更大dropout)
-wd: 1.0e-04          # weight decay
+attn_drop: 0.2
+proj_drop: 0.2
+ffn_drop: 0.3      # FFN 参数量大, 用更高 dropout
+wd: 1e-4
 gradient_clip_val: 1.0
-early_stop_patience: 10
+early_stop_patience: 30
+max_epochs: 100
 ```
 
 ---
 
 ## 14. 完整数据形状流转表
 
-> 以下基于 `scale_alpha: 0.5`, `initial_downsample_scale: [1,2,2]`。
-> 括号中的值是 `scale_alpha=1.0` / `[1,4,4]` 时的对照。
+> 基于 `scale_alpha: 0.4`, `initial_downsample_scale: [1,4,4]`
 
 | 阶段 | 形状 | 说明 |
 |------|------|------|
-| 原始 SST | (9131, 321, 561) | ERA5 原始数据 K |
-| 原始 Wind | (9131, 321, 561, 2) | u10, v10 m/s |
-| 原始 SLA | — 720×1440 逐日文件 | CMEMS AVISO 0.25° global, m |
-| 预处理后 SST | (9131, 161, 241) | 裁剪 120-180E, 10-50N, °C |
-| 预处理后 Wind | (9131, 161, 241, 2) | 同上 |
-| 预处理后 SLA | (9131, 161, 241) | 裁剪+双线性插值, m |
-| 气候态 | (366, 161, 241) | 逐日22年气候态 |
-| SSTA | (9131, 161, 241) | 异常值 °C |
-| 合并+归一化后 | (9131, 161, 241, 4) | ssta+u10+v10+sla, z-score, 陆地→0 |
-| 训练数据段 | (8035, 161, 241, 4) | 2001-2022 |
-| 验证数据段 | (731, 161, 241, 4) | 2023-2024 |
-| 测试数据段 | (365, 161, 241, 4) | 2025 |
-| 单样本 | (21, 161, 241, 4) | 14输入+7输出 |
-| 模型输入 X | (B, 14, 161, 241, 4) | 批次化 |
-| 模型输出 Y_true | (B, 7, 161, 241, 1) | 仅SSTA |
-| InitialEncoder后 | (B, 14, 81, 121, 64) | 2×2下采样 |
-| Enc Block 0 后 | (B, 14, 81, 121, 64) | mem[0] |
-| PatchMerge 后 | (B, 14, 41, 61, ~90) | 2×2下采样 |
-| Enc Block 1 后 | (B, 14, 41, 61, ~90) | mem[1] |
-| PatchMerge 后 | (B, 14, 21, 31, 128) | 2×2下采样 |
-| Enc Block 2 后 | (B, 14, 21, 31, 128) | mem[2] |
-| Decoder 初始化 | (B, 7, 21, 31, 128) | 零向量+位置编码 |
-| Dec Block 2 后 | (B, 7, 21, 31, 128) | cross→mem[2] |
-| Upsample 后 | (B, 7, 41, 61, ~90) | |
-| Dec Block 1 后 | (B, 7, 41, 61, ~90) | cross→mem[1] |
-| Upsample 后 | (B, 7, 81, 121, 64) | |
-| Dec Block 0 后 | (B, 7, 81, 121, 64) | cross→mem[0] |
+| 原始 SSTA | (9131, 161, 241) | 异常值 °C |
+| 原始 Wind | (9131, 161, 241, 2) | u10, v10 m/s |
+| 原始 SLA | (9131, 161, 241) | CMEMS AVISO, m |
+| 合并+Base归一化 | (9131, 161, 241, 4) | ssta, u10, v10, sla z-score |
+| +物理通道归一化 | (9131, 161, 241, 7) | +grad_x, grad_y, advection |
+| 训练数据段 | (8035, 161, 241, 7) | 2001-2022 |
+| 验证数据段 | (731, 161, 241, 7) | 2023-2024 |
+| 测试数据段 | (365, 161, 241, 7) | 2025 |
+| 单样本 | (21, 161, 241, 7) | 14输入+7输出 |
+| 模型输入 X | (B, 14, 161, 241, 7) | |
+| 模型输出 Y_true | (B, 7, 161, 241, 1) | 仅 SSTA 的 absolute 值 |
+| InitialEncoder 后 | (B, 14, 41, 61, 64) | 4×4 下采样 |
+| Enc Block 0 后 | (B, 14, 41, 61, 64) | mem[0] |
+| PatchMerge 后 | (B, 14, 21, 31, ~80) | 2×2 |
+| Enc Block 1 后 | (B, 14, 21, 31, ~80) | mem[1] |
+| PatchMerge 后 | (B, 14, 11, 16, ~97) | 2×2 |
+| Enc Block 2 后 | (B, 14, 11, 16, ~97) | mem[2] |
+| Decoder 初始化 | (B, 7, 11, 16, ~97) | 零向量+位置编码 |
+| Dec Block 2 后 | (B, 7, 11, 16, ~97) | |
+| Upsample 后 | (B, 7, 21, 31, ~80) | |
+| Dec Block 1 后 | (B, 7, 21, 31, ~80) | |
+| Upsample 后 | (B, 7, 41, 61, 64) | |
+| Dec Block 0 后 | (B, 7, 41, 61, 64) | |
 | FinalDecoder 后 | (B, 7, 161, 241, 64) | 恢复原始分辨率 |
-| 最终投影 | (B, 7, 161, 241, 1) | |
-| 掩码 | (161, 241, 1) | 1=海洋, 0=陆地 |
+| 最终投影 ΔSST | (B, 7, 161, 241, 1) | |
+| → X_last + Δ | (B, 7, 161, 241, 1) | training_step 中转换 |
+| 掩码 | (B, 161, 241, 1) | 1=海洋, 0=陆地 |
 
 ---
 
@@ -622,29 +537,38 @@ early_stop_patience: 10
 | **数据** | `data_dir` | `datasets/SST-PREDICT/` | |
 | | `in_len` | 14 | 输入天数 |
 | | `out_len` | 7 | 输出天数 |
-| | `var_names` | `[ssta, u10, v10, sla]` | 4通道 |
-| **模型** | `base_units` | 64 | 基础通道数 |
-| | `scale_alpha` | 0.5 | 通道增长因子 |
+| | `var_names` | `[ssta, u10, v10, sla, grad_x, grad_y, advection]` | **7通道** |
+| **模型** | `data_channels` | **7** | 输入通道数 |
+| | `input_shape` | `[14, 161, 241, 7]` | |
+| | `target_shape` | `[7, 161, 241, 1]` | |
+| | `base_units` | 64 | 基础通道数 |
+| | `scale_alpha` | 0.4 | 通道增长减速 |
 | | `enc_depth` | `[2,2,2]` | 3层, 每层2块 |
 | | `dec_depth` | `[2,2,2]` | 同上 |
 | | `num_global_vectors` | 8 | 全局向量数 |
-| | `initial_downsample_scale` | `[1,2,2]` | 空间4×压缩 |
+| | `initial_downsample_scale` | `[1,4,4]` | 空间16×压缩 |
 | | `num_heads` | 4 | 注意力头数 |
-| | `input_shape` | `[14, 161, 241, 4]` | 4通道输入 |
-| | `target_shape` | `[7, 161, 241, 1]` | 7天SSTA输出 |
-| **注意力** | `self_pattern` | `["axial","spatial_lg_8","divided_st"]` | 逐层不同 |
-| | `cross_pattern` | `["cross_1x1"]*3` | 像素级跨注意力 |
-| **正则化** | `attn_drop` | 0.2 | 注意力 dropout |
-| | `proj_drop` | 0.2 | 投影 dropout |
-| | `ffn_drop` | 0.3 | FFN dropout |
-| | `wd` | 1e-4 | weight decay |
-| **优化** | `lr` | 1e-4 | 学习率 |
-| | `total_batch_size` | 16 | 有效batch (micro_bs×accum) |
-| | `micro_batch_size` | 2 | 每卡batch |
-| | `max_epochs` | 50 | |
-| | `early_stop` | true | patience=10 |
-| **数据** | `stride` | 3 | 训练滑窗步长 |
-| **评估** | `save_top_k` | 3 | 保留最优3个模型 |
+| **注意力** | `self_pattern` | `["axial","spatial_lg_8","divided_st"]` | |
+| | `cross_pattern` | `["cross_1x1"]×3` | |
+| **正则化** | `attn_drop` | 0.2 | |
+| | `proj_drop` | 0.2 | |
+| | `ffn_drop` | 0.3 | |
+| | `wd` | 1e-4 | |
+| **优化** | `lr` | 1e-4 | |
+| | `total_batch_size` | 16 | 有效batch |
+| | `micro_batch_size` | 2 | |
+| | `max_epochs` | 100 | |
+| | `early_stop_patience` | 30 | |
+
+### 损失函数参数（硬编码在 `_compute_loss` 中）
+
+| 参数 | 值 | 说明 |
+|------|-----|------|
+| `day_weight_range` | [0.8, 1.5] | 逐天 MSE 线性权重 |
+| `λ_grad` | 0.5 | 梯度损失系数 |
+| `λ_tend` | 5.0 | 趋势损失系数 (主导项) |
+| `λ_anti` | 0.3 | 反持续性损失系数 |
+| `persist_ratio` | 0.95 | 反持续性触发阈值 |
 
 ---
 
@@ -654,62 +578,109 @@ early_stop_patience: 10
 
 ```
 experiments/nwp_7day/
-├── hparams.json          ← 超参数 (JSON, 训练开始时生成)
-├── metrics.csv           ← 每轮指标 (CSV, 新训练自动清空)
-│   列: epoch, train_loss, valid_loss, valid_mse, valid_mae, lr
+├── hparams.json          ← 超参数 (JSON)
+├── metrics.csv           ← 每轮指标 (CSV, 断点续训追加不覆盖)
+│   列: epoch, train_loss, valid_loss, valid_mse, valid_mae, learning_rate
 ├── test_metrics.csv      ← 测试分天指标 (°C, 7天)
 ├── cfg.yaml              ← 配置文件备份
+├── diagnosis/            ← 诊断套件输出 (10张图 + 终端报告)
 └── checkpoints/
-    ├── model-epoch=xxx.ckpt   ← 最优N个 (优化器+模型+LR)
-    ├── last.ckpt              ← 最新 (断点续训用)
-    └── best_model.pt          ← 纯模型权重 (推理用)
+    ├── model-epoch=xxx.ckpt   ← 最优N个
+    ├── last.ckpt              ← 最新 (断点续训)
+    └── best_model.pt          ← 纯权重 (推理用)
 ```
 
 ### 16.2 运行命令
 
 ```bash
-# 训练
+# 训练 (从头)
 python scripts/cuboid_transformer/nwp_sst/train_nwp_sst.py \
     --gpus 1 --save nwp_7day --data_dir datasets/SST-PREDICT/ \
     --cfg scripts/cuboid_transformer/nwp_sst/cfg_nwp.yaml
 
-# 断点续训
+# 断点续训 (保留已有 metrics)
 python scripts/cuboid_transformer/nwp_sst/train_nwp_sst.py \
     --gpus 1 --save nwp_7day --data_dir datasets/SST-PREDICT/ \
     --cfg scripts/cuboid_transformer/nwp_sst/cfg_nwp.yaml \
     --ckpt_name last.ckpt
 
-# 测试
+# 测试 (指定 checkpoint)
 python scripts/cuboid_transformer/nwp_sst/train_nwp_sst.py \
     --gpus 1 --test --save nwp_7day --data_dir datasets/SST-PREDICT/ \
     --cfg scripts/cuboid_transformer/nwp_sst/cfg_nwp.yaml \
     --ckpt_name model-epoch=XXX.ckpt
 
-# Persistence Baseline
-python scripts/cuboid_transformer/nwp_sst/persistence_baseline.py \
-    --data_dir datasets/SST-PREDICT/
-
-# 可视化
-python scripts/cuboid_transformer/nwp_sst/visualize_logs.py \
+# 模型诊断
+python scripts/cuboid_transformer/nwp_sst/diagnose_model.py \
     --exp_dir experiments/nwp_7day/ \
-    --ckpt_path experiments/nwp_7day/checkpoints/model-epoch=XXX.ckpt \
+    --ckpt_name model-epoch=XXX.ckpt \
     --data_dir datasets/SST-PREDICT/ \
-    --save experiment_summary
+    --cfg scripts/cuboid_transformer/nwp_sst/cfg_nwp.yaml
 ```
 
 ---
 
-## 17. Persistence Baseline
+## 17. 模型诊断套件
 
-**脚本**: `scripts/cuboid_transformer/nwp_sst/persistence_baseline.py`
+**文件**: `scripts/cuboid_transformer/nwp_sst/diagnose_model.py`
 
-将输入序列最后一天的 SSTA 作为未来所有时刻的预测:
-```python
-last_ssta = X[:, -1:, :, :, 0:1]
-pred = last_ssta.expand(-1, T_out, -1, -1, -1)
-```
+修复了早期 stats 加载 bug（`build_dataloaders` 返回 dict 无 `.files` 属性导致 stats={}）和 `collect_predictions` 缺失 `X_last + delta` 转换。
 
-使用与 Earthformer **完全相同**的 mask、聚合和温度转换流程。输出格式对齐 `test_metrics.csv`，可直接逐行对比 RMSE/MAE，判断模型是否学得比"重复昨天"更有价值。
+### 三大类诊断
+
+**I. 空间诊断 (1.1-1.3)**
+| 实验 | 内容 | 关键指标 |
+|------|------|---------|
+| 1.1 | 逐像素 RMSE 热力图 | Mean RMSE, top-5% 误差集中度 |
+| 1.2 | 区域 RMSE (6 个海洋学区域) | Kuroshio, Oyashio, 赤道等分区 |
+| 1.3 | 梯度误差 | grad bias (<0=过平滑), grad angle error (>45°=方向错误) |
+
+**II. 时间诊断 (2.1-2.4)**
+| 实验 | 内容 | 关键指标 |
+|------|------|---------|
+| 2.1 | RMSE 逐日增长 | slope ratio vs persistence |
+| 2.2 | 时间自相关衰减 | ACF lag-6 pred (应接近 truth 0.74, 而非 0.95+) |
+| 2.3 | 逐像素 vs Persistence | 负改进像素比例 |
+| 2.4 | 逐像素时间相关 | Day 7 低相关 (<0.5) 像素比例 |
+
+**III. 物理诊断 (3.1-3.3)**
+| 实验 | 内容 | 关键指标 |
+|------|------|---------|
+| 3.1 | SST 趋势 | dSST/dt 整体相关, 分 bin RMSE |
+| 3.2 | 平流一致性 | cos(dSST/dt, -u·∇SST) |
+| 3.3 | 扰动传播 | 注入 +1°C, 追踪质量和重心移动 |
+
+### 决策树输出
+根据诊断指标自动标注瓶颈: PERSISTENCE_LIKE, NO_TENDENCY_SKILL, IMAGE_FITTER 等。
+
+---
+
+## 18. 已知问题与改进方向
+
+### 当前状态 (2026-07 基线)
+
+| 指标 | 数值 | 评估 |
+|------|------|------|
+| avg RMSE | 0.483°C | 可接受, 略优于 persistence |
+| grad bias | -0.013 | ✅ 空间结构保持良好 |
+| grad angle error | 49.7° | ✅ 梯度方向基本正确 |
+| persistence worse % | 6.9% | ✅ 仅少数像素差于 persistence |
+| ACF lag-6 pred | 0.985 | ❌ 输出几乎不随时间变化 |
+| dSST/dt corr | 0.085 | ❌ 无法学习时间动态 |
+| RMSE growth ratio | 0.93 | ❌ 误差增速接近 persistence |
+
+### 根本原因
+
+模型一次性同时输出 7 步预测（Decoder query 之间无因果依赖），可以找到"所有帧输出相近值"的低 MSE 解。损失函数（即使 λ_tend=5.0）的梯度信号不足以在一次性 7 帧输出的架构下打破此行为。
+
+### 已验证无效的方向
+- FFT / spectral branch: 频域问题 ≠ SST 动力学问题
+- Pearson 相关作为趋势损失: 打平空间维度后测的是空间模式相关 (≈0.98)，不是时间动态 (≈0.09)
+
+### 推荐改进路线
+1. **自回归训练**: 模型只预测 1 天，预测结果滚入输入窗口循环 7 次
+2. **因果 Decoder**: 给 Decoder 加 causal temporal attention
+3. **物理先验 + 残差**: 用简单平流方程做基线，模型只学残差项
 
 ---
 
@@ -718,18 +689,15 @@ pred = last_ssta.expand(-1, T_out, -1, -1, -1)
 | 文件 | 内容 |
 |------|------|
 | `src/earthformer/cuboid_transformer/cuboid_transformer.py` | 完整模型: CuboidAttention, Encoder, Decoder, CuboidTransformerModel |
-| `src/earthformer/cuboid_transformer/cuboid_transformer_patterns.py` | 注意力模式注册表 (axial, spatial_lg, divided_st 等) |
-| `src/earthformer/cuboid_transformer/utils.py` | RMSNorm, padding, 位置嵌入, 初始化 |
-| `src/earthformer/datasets/nw_pacific_dataset.py` | 数据加载与 Dataset 构建 (4通道, stride=3, 7天) |
-| `scripts/cuboid_transformer/nwp_sst/train_nwp_sst.py` | 训练入口 + NWPPredictionModule |
+| `src/earthformer/cuboid_transformer/cuboid_transformer_patterns.py` | 注意力模式注册表 |
+| `src/earthformer/cuboid_transformer/utils.py` | RMSNorm, 位置嵌入, 初始化 |
+| `src/earthformer/datasets/nw_pacific_dataset.py` | 数据加载 (7通道, 物理派生通道, stride=3) |
+| `scripts/cuboid_transformer/nwp_sst/train_nwp_sst.py` | 训练入口 + NWPPredictionModule + 多物理损失 |
 | `scripts/cuboid_transformer/nwp_sst/cfg_nwp.yaml` | 训练配置 |
-| `scripts/cuboid_transformer/nwp_sst/visualize_logs.py` | 训练曲线 + 测试指标 + 预测图 (自动读cfg) |
-| `scripts/cuboid_transformer/nwp_sst/diagnose_model.py` | 模型缺陷诊断套件 (10项实验) |
-| `scripts/cuboid_transformer/nwp_sst/persistence_baseline.py` | Persistence 基线测试 |
-| `scripts/datasets/preprocess_nwp.py` | 空间裁剪+单位转换 |
-| `scripts/datasets/preprocess_sla.py` | SLA 数据预处理 |
-| `scripts/datasets/generate_ocean_mask.py` | 海陆掩码生成 |
-| `scripts/datasets/compute_climatology.py` | 逐日气候态计算 |
+| `scripts/cuboid_transformer/nwp_sst/diagnose_model.py` | 10项缺陷诊断套件 |
+| `scripts/cuboid_transformer/nwp_sst/persistence_baseline.py` | Persistence 基线 |
+| `scripts/datasets/preprocess_nwp.py` | SST/Wind 预处理 |
+| `scripts/datasets/preprocess_sla.py` | SLA 预处理 |
+| `scripts/datasets/generate_ocean_mask.py` | 海陆掩码 |
+| `scripts/datasets/compute_climatology.py` | 气候态计算 |
 | `scripts/datasets/compute_ssta.py` | SSTA 计算 |
-| `scripts/datasets/inspect_sla_data.py` | SLA 数据探查工具 |
-| `docs/loss_function详解.md` | 损失函数详细说明 |
