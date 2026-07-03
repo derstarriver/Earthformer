@@ -28,7 +28,7 @@ optim:
   warmup_percentage: 0.1
   early_stop: true
   early_stop_mode: "min"
-  early_stop_patience: 30
+  early_stop_patience: 10
   save_top_k: 3
 
 logging:

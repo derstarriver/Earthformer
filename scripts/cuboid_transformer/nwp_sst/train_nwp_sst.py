@@ -8,7 +8,7 @@ Output:  7 days × 161×241 × 1 channel  [ssta]
 python scripts/cuboid_transformer/nwp_sst/train_nwp_sst.py \
     --gpus 1 --save nwp_7day --data_dir datasets/SST-PREDICT/ \
     --cfg scripts/cuboid_transformer/nwp_sst/cfg_nwp.yaml
-88888888
+88888888tset
 # 断点续训
 python scripts/cuboid_transformer/nwp_sst/train_nwp_sst.py \
     --gpus 1 --save nwp_7day --data_dir datasets/SST-PREDICT/ \
