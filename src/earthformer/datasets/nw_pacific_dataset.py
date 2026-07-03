@@ -8,7 +8,7 @@ Builds a lazy-loading PyTorch Dataset from preprocessed ERA5 + SLA data:
   - SLA  (SLA_cropped.nc): daily sea level anomaly
   - Ocean mask (mask.npy): 1=ocean, 0=land
 
-    Input:  14 days × 161×241 × 7 channels [ssta, u10, v10, sla, grad_x, grad_y, advection]
+    Input:  14 days × 161×241 × 7 ch annels [ssta, u10, v10, sla, grad_x, grad_y, advection]
     Output:  7 days × 161×241 × 1 channel  [ssta]
 
 Usage:

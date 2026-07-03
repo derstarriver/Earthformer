@@ -154,3 +154,5 @@ dmypy.json
 # pretrained checkpoints
 *.pt
 /datasets/
+/src/earthformer/cuboid_transformer/spatial_frequency_branch.py
+/curves_train.png

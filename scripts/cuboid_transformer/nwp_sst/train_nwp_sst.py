@@ -8,7 +8,7 @@ Output:  7 days × 161×241 × 1 channel  [ssta]
 python scripts/cuboid_transformer/nwp_sst/train_nwp_sst.py \
     --gpus 1 --save nwp_7day --data_dir datasets/SST-PREDICT/ \
     --cfg scripts/cuboid_transformer/nwp_sst/cfg_nwp.yaml
-117369
+88888888
 # 断点续训
 python scripts/cuboid_transformer/nwp_sst/train_nwp_sst.py \
     --gpus 1 --save nwp_7day --data_dir datasets/SST-PREDICT/ \
@@ -159,6 +159,12 @@ class NWPPredictionModule(pl.LightningModule):
         self.total_num_steps = total_num_steps
         self.save_dir = save_dir
 
+        # Scheduled sampling: prob of using teacher SSTA (1.0 = pure teacher, 0.0 = pure self)
+        self._ss_prob = 1.0
+        self._ss_init = 1.0
+        self._ss_final = 0.2
+        self._ss_decay_epochs = 30
+
         # Metrics
         self.valid_mse = torchmetrics.MeanSquaredError()
         self.valid_mae = torchmetrics.MeanAbsoluteError()
@@ -195,8 +201,8 @@ class NWPPredictionModule(pl.LightningModule):
     @staticmethod
     def _default_optim():
         cfg = OmegaConf.create()
-        cfg.total_batch_size = 16
-        cfg.micro_batch_size = 2
+        cfg.total_batch_size = 18
+        cfg.micro_batch_size = 3
         cfg.seed = 0
         cfg.method = "adamw"
         cfg.lr = 1e-4
@@ -363,6 +369,15 @@ class NWPPredictionModule(pl.LightningModule):
             else:
                 print(f"  Metrics CSV (appending): {self._csv_path}")
 
+    def on_train_epoch_start(self):
+        """Decay scheduled-sampling probability each epoch."""
+        ep = self.trainer.current_epoch
+        if ep < self._ss_decay_epochs:
+            frac = ep / self._ss_decay_epochs
+            self._ss_prob = self._ss_init - (self._ss_init - self._ss_final) * frac
+        else:
+            self._ss_prob = self._ss_final
+
     def on_train_epoch_end(self):
         """Append one row to metrics CSV after each training epoch."""
         if not hasattr(self, '_csv_path'):
@@ -428,24 +443,36 @@ class NWPPredictionModule(pl.LightningModule):
     def _ar_forward(self, X, steps, Y_teacher=None):
         """Unroll the single-step model autoregressively for `steps` days.
 
-        Training  (Y_teacher is not None) — teacher forcing:
-            At each step the input window is updated with the *true* next-day
-            SSTA (Y_teacher[:, t]), not the model's own prediction.
-            This keeps the context distribution close to real data and lets
-            gradients flow cleanly through each step without compounding error.
+        Training — scheduled sampling with BPTT:
+            At each step, with probability `self._ss_prob`, the ground-truth
+            SSTA (Y_teacher[:, t]) is used to build the next context window
+            (teacher forcing — stable, but no cross-step gradient).
 
-        Val / Test  (Y_teacher is None) — free running:
-            The predicted SSTA is fed back as the SSTA channel of the next
-            window, so the model must cope with its own errors.
+            With probability (1 - self._ss_prob), the model's own predicted
+            SSTA (`pred_t`) is used as the next window's SSTA channel. Critically,
+            `pred_t` is NOT detached in this case, so the forward pass of step
+            t+1 has a differentiable input that connects back to the model
+            parameters at step t. This is full Back-Propagation Through Time
+            (BPTT) over the ssta channel.
+
+            The scheduled-sampling probability `self._ss_prob` decays linearly
+            from 1.0 → 0.2 over the first 30 epochs, forming a curriculum:
+            early epochs are pure teacher forcing (stable learning of the basic
+            mapping), later epochs gradually expose the model to its own errors
+            and establish the cross-step gradient path for `loss_tend`.
+
+        Val / Test (Y_teacher is None) — free running:
+            `next_ssta = pred_t.detach()`. No grad overhead, evaluates real
+            inference quality (model feeds its own predictions forward).
 
         Window channel layout (7 channels):
             0: ssta          ← updated each step (predicted or teacher)
             1: u10           ┐
-            2: v10           │ kept as the last known value from X
-            3: sla           │ (we have no forecast for these auxiliaries)
-            4: grad_x        │
+            2: v10           │ last known value from the previous step's window.
+            3: sla           │ These are always leaf tensors (from X data), so
+            4: grad_x        │ they carry no grad_fn regardless of detach.
             5: grad_y        ┘
-            6: advection     ← recomputed from updated ssta and u10/v10
+            6: advection     ← recomputed from updated ssta (grad follows ssta)
 
         Args:
             X          : (B, 14, H, W, 7)  initial context
@@ -457,44 +484,69 @@ class NWPPredictionModule(pl.LightningModule):
         """
         from torch.utils.checkpoint import checkpoint as grad_ckpt
 
+        is_train = Y_teacher is not None
         B, _, H, W, _ = X.shape
         window = X.clone()
         preds  = []
 
         for t in range(steps):
-            # ── single-step prediction ──
-            # gradient checkpointing: recompute activations on backward instead of storing
-            # them. Saves ~60% of per-step activation memory at ~20% speed cost.
-            if Y_teacher is not None:
+            # ── 1. single-step forward ──
+            if is_train:
                 delta = grad_ckpt(self.torch_nn_module, window, use_reentrant=False)
             else:
-                delta = self.forward(window)          # val/test: no grad, no overhead
+                delta = self.forward(window)
 
-            ssta_last = window[:, -1:, :, :, 0:1]    # (B, 1, H, W, 1)
+            ssta_last = window[:, -1:, :, :, 0:1]   # (B, 1, H, W, 1)
             pred_t    = ssta_last + delta
             preds.append(pred_t)
 
-            # ── build next context frame ──
-            if Y_teacher is not None:
-                next_ssta = Y_teacher[:, t:t+1, :, :, :]   # teacher forcing
+            if t == steps - 1:
+                break  # last step done — no need to build next window
+
+            # ── 2. decide next-ssta source ──
+            if is_train:
+                use_teacher = (torch.rand(1).item() < self._ss_prob)
+            else:
+                use_teacher = False   # val/test: always free running
+
+            if use_teacher:
+                # Teacher SSTA — stable context, but no cross-step gradient.
+                # detach() is explicit: we do NOT want Y_teacher to be part
+                # of any grad graph (Y is a data leaf, but explicit is safe).
+                next_ssta = Y_teacher[:, t:t+1, :, :, :].detach()
+            elif is_train:
+                # Self-prediction — NO detach. This is the BPTT path.
+                # pred_t = ssta_last + delta, where delta has grad_fn from
+                # model fwd. next_ssta carries that grad_fn into window[t+1],
+                # so d(loss)/d(pred[t+1]) * ∂pred[t+1]/∂window[t+1]
+                #                            * ∂window[t+1]/∂pred[t]
+                #                            * ∂pred[t]/∂params ≠ 0.
+                next_ssta = pred_t
             else:
                 next_ssta = pred_t.detach()
 
-            aux = window[:, -1:, :, :, 1:4].detach()  # u10, v10, sla — no grad needed
+            # ── 3. build next frame (7 channels) ──
+            # aux (u10/v10/sla): from the last frame of the window. These are
+            # always leaf tensors (originating from X data), so they carry no
+            # grad_fn even when ssta was self-predicted.
+            aux = window[:, -1:, :, :, 1:4]        # (B, 1, H, W, 3)
 
-            s   = next_ssta[:, 0, :, :, 0]
-            u   = aux[:, 0, :, :, 0]
-            v   = aux[:, 0, :, :, 1]
+            s = next_ssta[:, 0, :, :, 0]            # (B, H, W)
+            u = aux[:, 0, :, :, 0]
+            v = aux[:, 0, :, :, 1]
 
-            gx = torch.zeros_like(s)
-            gy = torch.zeros_like(s)
-            gx[:, :, 1:-1] = (s[:, :, 2:] - s[:, :, :-2]) / 2.0
-            gx[:, :, 0]    =  s[:, :, 1]  - s[:, :, 0]
-            gx[:, :, -1]   =  s[:, :, -1] - s[:, :, -2]
-            gy[:, 1:-1, :] = (s[:, 2:, :] - s[:, :-2, :]) / 2.0
-            gy[:, 0, :]    =  s[:, 1, :]  - s[:, 0, :]
-            gy[:, -1, :]   =  s[:, -1, :] - s[:, -2, :]
-            adv = -(u * gx + v * gy)
+            # Spatial gradients — torch ops preserve grad_fn of s
+            gx = torch.cat([
+                s[:, :, 1:2]    - s[:, :, 0:1],       # forward diff,  left edge
+                (s[:, :, 2:]    - s[:, :, :-2]) / 2.0, # central diff, interior
+                s[:, :, -1:]    - s[:, :, -2:-1]       # backward diff, right edge
+            ], dim=2)
+            gy = torch.cat([
+                s[:, 1:2, :]    - s[:, 0:1, :],        # forward diff,  bottom edge
+                (s[:, 2:, :]    - s[:, :-2, :]) / 2.0,  # central diff, interior
+                s[:, -1:, :]    - s[:, -2:-1, :]        # backward diff, top edge
+            ], dim=1)
+            adv = -(u * gx + v * gy)                  # (B, H, W)
 
             next_frame = torch.stack([
                 next_ssta[:, 0, :, :, 0],
@@ -504,9 +556,10 @@ class NWPPredictionModule(pl.LightningModule):
                 gx, gy, adv,
             ], dim=-1).unsqueeze(1)                   # (B, 1, H, W, 7)
 
-            # detach the new window so only the current step's graph is retained,
-            # not the full chain back to step 0. Gradients still flow via pred_t.
-            window = torch.cat([window[:, 1:].detach(), next_frame], dim=1)
+            # Slide window: old frames (always leaf tensors from X data) are safe
+            # to keep as-is; next_frame may carry grad_fn on ssta-derived channels
+            # when self-prediction was selected.
+            window = torch.cat([window[:, 1:], next_frame], dim=1)
 
         return torch.cat(preds, dim=1)   # (B, steps, H, W, 1)
 
@@ -570,14 +623,16 @@ class NWPPredictionModule(pl.LightningModule):
         mask_t = mask.reshape(B, 1, mask.shape[1], mask.shape[2], 1)
         X_last = X[:, -1:, :, :, 0:1]   # (B, 1, H, W, 1)
 
-        # Teacher-forced AR: each step receives the true previous SSTA as context.
-        # Gradients flow through all 7 forward passes (no detach on teacher signal).
+        # Scheduled-sampling AR: some steps use teacher SSTA, some use self-prediction.
+        # Self-prediction steps carry cross-step gradients (BPTT through ssta channel).
+        # Log SS probability once per epoch.
         pred = self._ar_forward(X, steps=PRED_LEN, Y_teacher=Y)  # (B, 7, H, W, 1)
 
         loss, components = self._compute_loss(pred, Y, mask_t, X_last)
         self.log('train_loss', loss, on_step=True, on_epoch=True)
         for k, v in components.items():
             self.log(f'train_{k}', v, on_step=False, on_epoch=True)
+        self.log('ss_prob', self._ss_prob, on_step=False, on_epoch=True)
         return loss
 
     def validation_step(self, batch, batch_idx, dataloader_idx=0):

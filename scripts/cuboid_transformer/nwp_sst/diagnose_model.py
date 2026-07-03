@@ -148,23 +148,28 @@ def _ar_forward(model, X, steps=7):
         pred_t     = ssta_last + delta                      # absolute SSTA
         preds.append(pred_t)
 
+        # last step — nothing left to feed forward
+        if len(preds) == steps:
+            break
+
         next_ssta = pred_t.to(X.device)                     # feed prediction back
 
-        # auxiliary channels: repeat last known values
         aux = window[:, -1:, :, :, 1:4]                    # (B, 1, H, W, 3) u10/v10/sla
 
         s = next_ssta[:, 0, :, :, 0]
         u = aux[:, 0, :, :, 0]
         v = aux[:, 0, :, :, 1]
 
-        gx = torch.zeros_like(s)
-        gy = torch.zeros_like(s)
-        gx[:, :, 1:-1] = (s[:, :, 2:]  - s[:, :, :-2])  / 2.0
-        gx[:, :, 0]    =  s[:, :, 1]   - s[:, :, 0]
-        gx[:, :, -1]   =  s[:, :, -1]  - s[:, :, -2]
-        gy[:, 1:-1, :] = (s[:, 2:, :]  - s[:, :-2, :]) / 2.0
-        gy[:, 0, :]    =  s[:, 1, :]   - s[:, 0, :]
-        gy[:, -1, :]   =  s[:, -1, :]  - s[:, -2, :]
+        gx = torch.cat([
+            s[:, :, 1:2]    - s[:, :, 0:1],
+            (s[:, :, 2:]    - s[:, :, :-2]) / 2.0,
+            s[:, :, -1:]    - s[:, :, -2:-1]
+        ], dim=2)
+        gy = torch.cat([
+            s[:, 1:2, :]    - s[:, 0:1, :],
+            (s[:, 2:, :]    - s[:, :-2, :]) / 2.0,
+            s[:, -1:, :]    - s[:, -2:-1, :]
+        ], dim=1)
         adv = -(u * gx + v * gy)
 
         next_frame = torch.stack([
